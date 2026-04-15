@@ -1,0 +1,48 @@
+{
+  "name": "projet-perso-draw",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "sync:excalidraw-assets": "node scripts/sync-excalidraw-assets.mjs",
+    "build": "npm run sync:excalidraw-assets && tsc -b && vite build",
+    "lint": "eslint .",
+    "preview": "vite preview",
+    "android:add": "npx cap add android",
+    "android:copy": "npx cap copy android",
+    "android:sync": "npm run build && npx cap sync android",
+    "android:open": "npx cap open android",
+    "android:build:debug": "npm run android:sync && cd android && ANDROID_HOME=${ANDROID_HOME:-$HOME/Android/Sdk} ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Android/Sdk}} JAVA_HOME=${JAVA_HOME:-/opt/android-studio/jbr} ./gradlew assembleDebug",
+    "android:build:release": "npm run android:sync && cd android && ANDROID_HOME=${ANDROID_HOME:-$HOME/Android/Sdk} ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Android/Sdk}} JAVA_HOME=${JAVA_HOME:-/opt/android-studio/jbr} ./gradlew assembleRelease",
+    "postinstall": "npm run sync:excalidraw-assets"
+  },
+  "dependencies": {
+    "@capacitor/app": "^5.0.8",
+    "@capacitor/core": "^5.7.8",
+    "@capacitor/filesystem": "^5.2.2",
+    "@capacitor/preferences": "^5.0.8",
+    "@capacitor/share": "^5.0.8",
+    "@capacitor/splash-screen": "^5.0.8",
+    "@capacitor/status-bar": "^5.0.8",
+    "@excalidraw/excalidraw": "^0.18.0",
+    "idb-keyval": "^6.2.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@capacitor/android": "^5.7.8",
+    "@capacitor/cli": "^5.7.8",
+    "@eslint/js": "^9.13.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "eslint": "^9.13.0",
+    "eslint-plugin-react-hooks": "^5.0.0",
+    "eslint-plugin-react-refresh": "^0.4.14",
+    "globals": "^15.11.0",
+    "typescript": "~5.6.2",
+    "typescript-eslint": "^8.11.0",
+    "vite": "^5.4.10"
+  }
+}

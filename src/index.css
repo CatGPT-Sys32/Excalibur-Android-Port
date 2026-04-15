@@ -1,0 +1,246 @@
+:root {
+  color-scheme: light;
+  font-family: "Assistant", "Segoe UI", sans-serif;
+  --menu-surface: rgba(255, 255, 255, 0.9);
+  --menu-surface-alt: rgba(244, 249, 255, 0.92);
+  --menu-border: rgba(75, 94, 129, 0.2);
+  --menu-border-strong: rgba(61, 87, 136, 0.34);
+  --menu-shadow: 0 14px 28px rgba(30, 48, 82, 0.14);
+  --menu-shadow-hover: 0 16px 34px rgba(27, 44, 77, 0.2);
+  --menu-text-soft: rgba(41, 53, 75, 0.68);
+  background:
+    radial-gradient(circle at top left, rgba(216, 229, 255, 0.8), transparent 42%),
+    radial-gradient(circle at top right, rgba(225, 252, 246, 0.55), transparent 38%),
+    #f3f6fb;
+  color: #27272c;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+}
+
+html[data-app-theme="dark"] {
+  color-scheme: dark;
+  background:
+    radial-gradient(circle at top left, rgba(97, 110, 137, 0.18), transparent 34%),
+    radial-gradient(circle at bottom right, rgba(49, 59, 77, 0.24), transparent 32%),
+    #1b1d24;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+.draw-app-shell {
+  height: 100%;
+}
+
+.draw-hidden-input {
+  position: absolute;
+  width: 0;
+  height: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.draw-loading-shell {
+  display: grid;
+  place-items: center;
+  height: 100%;
+  padding: 24px;
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.68), rgba(238, 246, 255, 0.58)),
+    #f3f6fb;
+}
+
+.draw-loading-card {
+  width: min(420px, 100%);
+  padding: 32px 28px;
+  border-radius: 28px;
+  border: 1px solid rgba(54, 84, 134, 0.14);
+  background: rgba(255, 255, 255, 0.82);
+  box-shadow: 0 24px 80px rgba(41, 56, 88, 0.14);
+  backdrop-filter: blur(10px);
+}
+
+.draw-loading-card h1 {
+  margin: 10px 0 12px;
+  font-size: clamp(2rem, 4vw, 2.7rem);
+  line-height: 0.95;
+}
+
+.draw-loading-card p {
+  margin: 0;
+  line-height: 1.5;
+  color: rgba(39, 39, 44, 0.76);
+}
+
+.draw-loading-kicker {
+  font-size: 0.76rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.draw-loading-mark {
+  width: 72px;
+  height: 72px;
+  border-radius: 22px;
+  background:
+    linear-gradient(145deg, rgba(219, 237, 255, 0.92), rgba(239, 255, 250, 0.92)),
+    #edf5ff;
+  box-shadow:
+    0 10px 24px rgba(45, 63, 97, 0.16),
+    inset 0 0 0 1px rgba(52, 76, 120, 0.1);
+  position: relative;
+}
+
+.draw-loading-mark::before,
+.draw-loading-mark::after {
+  content: "";
+  position: absolute;
+  border-radius: 999px;
+  background: #27272c;
+}
+
+.draw-loading-mark::before {
+  width: 30px;
+  height: 3px;
+  top: 34px;
+  left: 22px;
+  transform: rotate(-19deg);
+}
+
+.draw-loading-mark::after {
+  width: 11px;
+  height: 11px;
+  top: 29px;
+  left: 45px;
+  transform: rotate(-19deg);
+}
+
+.draw-menu-button {
+  width: 100%;
+  border: 1px solid var(--menu-border);
+  border-radius: 14px;
+  background: linear-gradient(155deg, var(--menu-surface), var(--menu-surface-alt));
+  color: inherit;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 14px;
+  text-align: left;
+  transition:
+    border-color 120ms ease,
+    background 120ms ease,
+    transform 120ms ease,
+    box-shadow 120ms ease;
+  box-shadow: var(--menu-shadow);
+}
+
+.draw-menu-button-label {
+  font-weight: 600;
+}
+
+.draw-menu-button-meta {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--menu-text-soft);
+}
+
+.draw-menu-badge {
+  font-size: 0.76rem;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  font-weight: 700;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(69, 93, 138, 0.28);
+  background: rgba(84, 124, 201, 0.12);
+}
+
+.draw-menu-section-title {
+  padding: 8px 4px 6px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  color: rgba(55, 81, 124, 0.72);
+}
+
+.draw-menu-status-card {
+  display: grid;
+  gap: 10px;
+  padding: 13px;
+  border-radius: 16px;
+  border: 1px solid var(--menu-border-strong);
+  background: linear-gradient(155deg, rgba(246, 250, 255, 0.96), rgba(239, 247, 255, 0.9));
+  box-shadow: 0 10px 24px rgba(35, 57, 95, 0.12);
+}
+
+.draw-menu-status-card div {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 14px;
+}
+
+.draw-menu-status-card span {
+  font-size: 0.82rem;
+  color: rgba(42, 61, 97, 0.68);
+}
+
+.draw-menu-status-card strong {
+  font-size: 0.85rem;
+}
+
+.draw-menu-button:hover {
+  border-color: rgba(69, 101, 159, 0.45);
+  background: linear-gradient(155deg, rgba(255, 255, 255, 0.98), rgba(235, 245, 255, 0.94));
+  transform: translateY(-1px);
+  box-shadow: var(--menu-shadow-hover);
+}
+
+html[data-app-theme="dark"] .draw-loading-shell {
+  background:
+    linear-gradient(135deg, rgba(21, 24, 31, 0.88), rgba(30, 34, 43, 0.72)),
+    #1b1d24;
+}
+
+html[data-app-theme="dark"] .draw-loading-card,
+html[data-app-theme="dark"] .draw-menu-button,
+html[data-app-theme="dark"] .draw-menu-status-card {
+  border-color: rgba(255, 255, 255, 0.08);
+  background: rgba(29, 33, 42, 0.84);
+  color: #f5f7fb;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.26);
+}
+
+html[data-app-theme="dark"] .draw-loading-card p,
+html[data-app-theme="dark"] .draw-menu-button-meta,
+html[data-app-theme="dark"] .draw-menu-section-title,
+html[data-app-theme="dark"] .draw-menu-status-card span {
+  color: rgba(245, 247, 251, 0.72);
+}
+
+html[data-app-theme="dark"] .draw-menu-badge {
+  border-color: rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+@media (max-width: 768px) {
+  .draw-loading-card {
+    padding: 26px 22px;
+  }
+}
