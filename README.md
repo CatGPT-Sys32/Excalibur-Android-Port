@@ -1,4 +1,4 @@
-# Excalidraw Personal for Android
+# Excalibur Android Port
 
 Android-packaged personal-use Excalidraw built around the official `@excalidraw/excalidraw` editor, with a thin Capacitor shell and an Android bridge for file intents and stylus metadata.
 
