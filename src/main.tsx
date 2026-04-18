@@ -5,10 +5,14 @@ import App from "./App";
 
 declare global {
   interface Window {
-    EXCALIDRAW_ASSET_PATH?: string;
+    EXCALIDRAW_ASSET_PATH?: string | string[];
   }
 }
 
-window.EXCALIDRAW_ASSET_PATH = `${import.meta.env.BASE_URL}excalidraw-assets/`;
+const baseAssetPath = import.meta.env.BASE_URL;
+window.EXCALIDRAW_ASSET_PATH = [
+  baseAssetPath,
+  `${baseAssetPath}excalidraw-assets/`,
+];
 
 ReactDOM.createRoot(document.getElementById("root")!).render(<App />);

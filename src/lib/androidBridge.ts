@@ -1,11 +1,16 @@
 import { registerPlugin, type PluginListenerHandle } from "@capacitor/core";
 
-export type PendingOpenPayload = {
+export type PendingOpenFile = {
   name: string;
   mimeType: string;
   data: string;
   encoding: "utf8" | "base64";
+  size?: number;
+};
+
+export type PendingOpenPayload = PendingOpenFile & {
   action: "view" | "send" | "unknown";
+  files?: PendingOpenFile[];
 };
 
 export type NativeStylusSnapshot = {
@@ -31,6 +36,7 @@ interface DrawBridgePlugin {
   getPendingOpen(): Promise<{ pendingOpen: PendingOpenPayload | null }>;
   clearPendingOpen(): Promise<void>;
   getStylusSnapshot(): Promise<{ stylus: NativeStylusSnapshot | null }>;
+  openStorageDirectory(): Promise<{ opened: boolean; uri?: string; error?: string }>;
   addListener(
     eventName: "intentOpen",
     listenerFunc: (event: IntentOpenEvent) => void,
@@ -69,6 +75,14 @@ export const getStylusSnapshotSafe = async () => {
     return (await DrawBridge.getStylusSnapshot()).stylus;
   } catch {
     return null;
+  }
+};
+
+export const openStorageDirectorySafe = async () => {
+  try {
+    return await DrawBridge.openStorageDirectory();
+  } catch {
+    return { opened: false, error: "Failed to call native storage bridge." };
   }
 };
 

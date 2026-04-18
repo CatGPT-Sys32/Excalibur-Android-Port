@@ -5,12 +5,7 @@ import {
   CaptureUpdateAction,
   Excalidraw,
   MIME_TYPES,
-  MainMenu,
   WelcomeScreen,
-  exportToBlob,
-  exportToSvg,
-  loadFromBlob,
-  loadLibraryFromBlob,
 } from "@excalidraw/excalidraw";
 import {
   startTransition,
@@ -20,23 +15,56 @@ import {
   useState,
 } from "react";
 
+import { BackupCenterModal } from "./components/BackupCenterModal";
+import { CanvasManagerModal } from "./components/CanvasManagerModal";
+import { DrawMainMenu } from "./components/DrawMainMenu";
+import { PageSettingsModal } from "./components/PageSettingsModal";
+import { PageTemplateOverlay } from "./components/PageTemplateOverlay";
+import { TemplatePickerModal } from "./components/TemplatePickerModal";
+import { isNativePlatform } from "./lib/capacitor";
+import {
+  DEFAULT_PAGE_SETTINGS,
+  getPageTemplateOption,
+  isPageTemplateEnabled,
+  normalizePageSettings,
+  type PageSettings,
+  type PageViewport,
+} from "./lib/pageSettings";
+import { CANVAS_TEMPLATES, type CanvasTemplate } from "./lib/templates";
+
 import {
   addIntentOpenListener,
   addStylusChangeListener,
   clearPendingOpenSafe,
   getPendingOpenSafe,
   getStylusSnapshotSafe,
+  openStorageDirectorySafe,
   type NativeStylusSnapshot,
   type PendingOpenPayload,
 } from "./lib/androidBridge";
 import {
   DEFAULT_SETTINGS,
+  createBackupZip,
+  deleteSavedScene,
+  duplicateSavedScene,
+  getSavedSceneThumbnail,
+  listSavedScenesFromDevice,
+  listCanvasVersions,
   loadAppBootstrap,
+  loadSceneFromBlobData,
   loadSceneFromPath,
+  loadSceneFromSavedDeviceFile,
   makeSceneTitle,
   persistLibrary,
+  persistSavedSceneThumbnail,
   persistSettings,
+  renameSavedScene,
+  restoreBackupZip,
+  restoreCanvasVersion,
+  saveCanvasVersion,
   saveBlobExport,
+  saveImportedLibraryFile,
+  saveImportedSceneFile,
   saveRecoverySnapshot,
   saveTextExport,
   sceneHasContent,
@@ -44,26 +72,33 @@ import {
   serializeScene,
   suggestedFilename,
   writeAutosave,
+  type CanvasVersionMeta,
   type DrawSettings,
+  type SavedSceneFile,
   type SavedExport,
   type ScenePayload,
   type SceneSnapshotMeta,
 } from "./lib/persistence";
+import { newImageElement, syncInvalidIndices } from "@excalidraw/element";
 import type {
   AppState,
+  BinaryFileData,
   BinaryFiles,
+  DataURL,
   ExcalidrawImperativeAPI,
   ExcalidrawInitialDataState,
   LibraryItems,
 } from "@excalidraw/excalidraw/types";
 import type {
   ExcalidrawFreeDrawElement,
+  ExcalidrawImageElement,
   OrderedExcalidrawElement,
   Theme,
 } from "@excalidraw/excalidraw/element/types";
 
 const AUTOSAVE_DEBOUNCE_MS = 700;
 const SNAPSHOT_INTERVAL_MS = 3 * 60 * 1000;
+const MAX_PENDING_OPEN_BYTES = 8 * 1024 * 1024;
 const STRAIGHTEN_HOLD_MS = 240;
 const STRAIGHTEN_MOVE_THRESHOLD = 5;
 const STRAIGHTEN_MIN_SEGMENT = 12;
@@ -99,6 +134,13 @@ type ExportScenePayload = {
   elements: readonly OrderedExcalidrawElement[];
   appState: AppState;
   files: BinaryFiles;
+};
+
+type ImportFile = {
+  name: string;
+  mimeType: string;
+  blob: Blob;
+  size: number;
 };
 
 const distanceBetweenPoints = (first: ScenePoint, second: ScenePoint) =>
@@ -142,8 +184,8 @@ const createStraightenedFreeDrawElement = (
 ): ExcalidrawFreeDrawElement => {
   const minX = Math.min(anchor.x, end.x);
   const minY = Math.min(anchor.y, end.y);
-  const startPoint: [number, number] = [anchor.x - minX, anchor.y - minY];
-  const endPoint: [number, number] = [end.x - minX, end.y - minY];
+  const startPoint = [anchor.x - minX, anchor.y - minY] as ExcalidrawFreeDrawElement["points"][number];
+  const endPoint = [end.x - minX, end.y - minY] as ExcalidrawFreeDrawElement["points"][number];
   const firstPressure = element.pressures[0] ?? 0.5;
   const lastPressure = element.pressures[element.pressures.length - 1] ?? firstPressure;
 
@@ -155,34 +197,32 @@ const createStraightenedFreeDrawElement = (
     height: Math.abs(end.y - anchor.y),
     points: [startPoint, endPoint],
     pressures: [firstPressure, lastPressure],
-    lastCommittedPoint: endPoint,
     updated: Date.now(),
     version: element.version + 1,
     versionNonce: Math.trunc(Math.random() * 2147483647),
   };
 };
 
-const formatTimestamp = (value: string | null) => {
-  if (!value) {
-    return "Not saved yet";
-  }
-
-  return new Intl.DateTimeFormat(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(new Date(value));
-};
-
-const pendingOpenToBlob = (pendingOpen: PendingOpenPayload, fallbackMimeType: string) => {
+const pendingOpenToBlob = (
+  pendingOpen: Pick<PendingOpenPayload, "data" | "encoding" | "mimeType" | "name">,
+  fallbackMimeType: string,
+) => {
   const mimeType = pendingOpen.mimeType || fallbackMimeType;
 
   if (pendingOpen.encoding === "base64") {
+    const estimatedBytes = Math.floor((pendingOpen.data.length * 3) / 4);
+    if (estimatedBytes > MAX_PENDING_OPEN_BYTES) {
+      throw new Error("Incoming file exceeds size limit");
+    }
+
     const bytes = Uint8Array.from(atob(pendingOpen.data), (char) =>
       char.charCodeAt(0),
     );
     return new Blob([bytes], { type: mimeType });
+  }
+
+  if (new TextEncoder().encode(pendingOpen.data).byteLength > MAX_PENDING_OPEN_BYTES) {
+    throw new Error("Incoming file exceeds size limit");
   }
 
   return new Blob([pendingOpen.data], { type: mimeType });
@@ -215,7 +255,81 @@ const shareSavedExport = async (savedExport: SavedExport, title: string) => {
   });
 };
 
-const onOffLabel = (enabled: boolean) => (enabled ? "On" : "Off");
+const blobToDataUrl = async (blob: Blob) =>
+  new Promise<DataURL>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error);
+    reader.onload = () => {
+      if (typeof reader.result !== "string") {
+        reject(new Error("Could not load image data"));
+        return;
+      }
+      resolve(reader.result as DataURL);
+    };
+    reader.readAsDataURL(blob);
+  });
+
+const loadImageDimensions = async (dataUrl: DataURL) =>
+  new Promise<{ width: number; height: number }>((resolve) => {
+    const image = new Image();
+    image.onload = () => {
+      resolve({
+        width: image.naturalWidth || 640,
+        height: image.naturalHeight || 480,
+      });
+    };
+    image.onerror = () => resolve({ width: 640, height: 480 });
+    image.src = dataUrl;
+  });
+
+const isLibraryImport = (file: Pick<ImportFile, "name" | "mimeType">) => {
+  const name = file.name.toLowerCase();
+  const mimeType = file.mimeType.toLowerCase();
+  return name.endsWith(".excalidrawlib") || mimeType.includes("excalidrawlib");
+};
+
+const isImageImport = (file: Pick<ImportFile, "name" | "mimeType">) => {
+  const name = file.name.toLowerCase();
+  const mimeType = file.mimeType.toLowerCase();
+  return (
+    mimeType.startsWith("image/") ||
+    /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i.test(name)
+  );
+};
+
+const isSceneImport = (file: Pick<ImportFile, "name" | "mimeType">) => {
+  const name = file.name.toLowerCase();
+  const mimeType = file.mimeType.toLowerCase();
+  return (
+    !isLibraryImport(file) &&
+    !isImageImport(file) &&
+    (name.endsWith(".excalidraw") ||
+      name.endsWith(".json") ||
+      mimeType.includes("json"))
+  );
+};
+
+const pendingOpenFiles = (pendingOpen: PendingOpenPayload) =>
+  pendingOpen.files?.length ? pendingOpen.files : [pendingOpen];
+
+const shouldDeferPendingOpen = (pendingOpen: PendingOpenPayload | null) => {
+  if (!pendingOpen) {
+    return false;
+  }
+
+  const files = pendingOpenFiles(pendingOpen);
+  return files.length > 1 || files.some((file) => isImageImport(file));
+};
+
+const makeElementId = () =>
+  `import-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+const formatExportTimestamp = (date: Date) => {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(
+    date.getDate(),
+  )}-${pad(date.getHours())}${pad(date.getMinutes())}`;
+};
 
 function App() {
   const [api, setApi] = useState<ExcalidrawImperativeAPI | null>(null);
@@ -239,14 +353,34 @@ function App() {
   const [viewModeEnabled, setViewModeEnabled] = useState(false);
   const [gridModeEnabled, setGridModeEnabled] = useState(false);
   const [objectsSnapModeEnabled, setObjectsSnapModeEnabled] = useState(false);
+  const [pageSettings, setPageSettings] =
+    useState<PageSettings>(DEFAULT_PAGE_SETTINGS);
+  const [pageViewport, setPageViewport] = useState<PageViewport | null>(null);
+  const [canvasDirectoryOpen, setCanvasDirectoryOpen] = useState(false);
+  const [canvasDirectoryLoading, setCanvasDirectoryLoading] = useState(false);
+  const [savedCanvasFiles, setSavedCanvasFiles] = useState<SavedSceneFile[]>([]);
+  const [templatePickerOpen, setTemplatePickerOpen] = useState(false);
+  const [pageSettingsOpen, setPageSettingsOpen] = useState(false);
+  const [backupCenterOpen, setBackupCenterOpen] = useState(false);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [activeTimelineScene, setActiveTimelineScene] =
+    useState<SavedSceneFile | null>(null);
+  const [canvasVersions, setCanvasVersions] = useState<CanvasVersionMeta[]>([]);
+  const [canvasVersionsLoading, setCanvasVersionsLoading] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null);
   const latestSceneRef = useRef<ScenePayload | null>(null);
+  const currentSavedSceneRef = useRef<SavedSceneFile | null>(null);
+  const deferredPendingOpenRef = useRef<PendingOpenPayload | null>(null);
+  const refreshSavedScenesRef = useRef<(() => Promise<void>) | null>(null);
   const recentsRef = useRef<SceneSnapshotMeta[]>([]);
   const settingsRef = useRef<DrawSettings>(DEFAULT_SETTINGS);
+  const pageSettingsRef = useRef<PageSettings>(DEFAULT_PAGE_SETTINGS);
+  const pageViewportRef = useRef<PageViewport | null>(null);
   const libraryItemsRef = useRef<LibraryItems>([]);
   const autosaveTimerRef = useRef<number | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
   const hasMeaningfulChangeRef = useRef(false);
   const straightenSessionRef = useRef<StraightenSession>({
     ...EMPTY_STRAIGHTEN_SESSION,
@@ -269,6 +403,10 @@ function App() {
   }, [settings]);
 
   useEffect(() => {
+    pageSettingsRef.current = pageSettings;
+  }, [pageSettings]);
+
+  useEffect(() => {
     libraryItemsRef.current = libraryItems;
   }, [libraryItems]);
 
@@ -278,10 +416,19 @@ function App() {
   }, [sceneName, theme]);
 
   const showToast = useCallback((message: string) => {
+    if (toastTimerRef.current) {
+      window.clearTimeout(toastTimerRef.current);
+    }
+
     apiRef.current?.setToast({
       message,
-      duration: 2600,
+      duration: Infinity,
     });
+
+    toastTimerRef.current = window.setTimeout(() => {
+      apiRef.current?.setToast(null);
+      toastTimerRef.current = null;
+    }, 10000);
   }, []);
 
   const resetStraightenSession = useCallback(() => {
@@ -377,7 +524,7 @@ function App() {
         return false;
       }
 
-      let serialized = serializeScene(payload);
+      let serialized = serializeScene(payload, pageSettingsRef.current);
 
       try {
         await writeAutosave(serialized);
@@ -385,10 +532,13 @@ function App() {
       } catch {
         try {
           // Compact fallback keeps autosave available when file payloads are too large.
-          serialized = serializeScene({
-            ...payload,
-            files: {} as BinaryFiles,
-          });
+          serialized = serializeScene(
+            {
+              ...payload,
+              files: {} as BinaryFiles,
+            },
+            pageSettingsRef.current,
+          );
           await writeAutosave(serialized);
           setLastAutosavedAt(new Date().toISOString());
         } catch {
@@ -454,6 +604,12 @@ function App() {
         return;
       }
 
+      const nextPageSettings = normalizePageSettings(
+        (sceneData as ExcalidrawInitialDataState & { pageSettings?: PageSettings })
+          .pageSettings,
+      );
+      setPageSettings(nextPageSettings);
+      pageSettingsRef.current = nextPageSettings;
       currentApi.history.clear();
 
       if (sceneData.libraryItems) {
@@ -501,11 +657,161 @@ function App() {
   );
 
   const stageCurrentSceneForImport = useCallback(async () => {
-    if (!latestSceneRef.current || !sceneHasContent(latestSceneRef.current)) {
+    const payload = latestSceneRef.current;
+    if (!payload || !sceneHasContent(payload)) {
       return;
     }
+
+    if (currentSavedSceneRef.current && hasMeaningfulChangeRef.current) {
+      const serializedScene = serializeScene(payload, pageSettingsRef.current);
+      await saveCanvasVersion(
+        currentSavedSceneRef.current,
+        serializedScene,
+        `Before leaving ${currentSavedSceneRef.current.name}`,
+        payload.elements.filter((element) => !element.isDeleted).length,
+      ).catch(() => undefined);
+    }
+
     await persistCurrentScene(true);
   }, [persistCurrentScene]);
+
+  const insertImageFiles = useCallback(
+    async (imageFiles: readonly ImportFile[]) => {
+      const currentApi = apiRef.current;
+      if (!currentApi || imageFiles.length === 0) {
+        return 0;
+      }
+
+      const currentState = currentApi.getAppState();
+      const zoom = currentState.zoom?.value || 1;
+      const viewportCenter = {
+        x: -currentState.scrollX + currentState.width / (2 * zoom),
+        y: -currentState.scrollY + currentState.height / (2 * zoom),
+      };
+      const imageElements: ExcalidrawImageElement[] = [];
+      const binaryFiles: BinaryFileData[] = [];
+
+      for (const [index, file] of imageFiles.entries()) {
+        const dataURL = await blobToDataUrl(file.blob);
+        const dimensions = await loadImageDimensions(dataURL);
+        const scale = Math.min(1, 640 / Math.max(dimensions.width, dimensions.height));
+        const width = Math.max(1, Math.round(dimensions.width * scale));
+        const height = Math.max(1, Math.round(dimensions.height * scale));
+        const fileId = makeElementId() as BinaryFileData["id"];
+        const offset = index * 28;
+
+        binaryFiles.push({
+          id: fileId,
+          mimeType: (file.mimeType || MIME_TYPES.binary) as BinaryFileData["mimeType"],
+          dataURL,
+          created: Date.now(),
+          lastRetrieved: Date.now(),
+        });
+
+        imageElements.push(
+          newImageElement({
+            type: "image",
+            x: viewportCenter.x - width / 2 + offset,
+            y: viewportCenter.y - height / 2 + offset,
+            width,
+            height,
+            fileId,
+            status: "saved",
+          }),
+        );
+      }
+
+      currentApi.addFiles(binaryFiles);
+      currentApi.updateScene({
+        elements: syncInvalidIndices([
+          ...currentApi.getSceneElementsIncludingDeleted(),
+          ...imageElements,
+        ]),
+        captureUpdate: CaptureUpdateAction.IMMEDIATELY,
+      });
+      await persistCurrentScene(true);
+      return imageElements.length;
+    },
+    [persistCurrentScene],
+  );
+
+  const processImportFiles = useCallback(
+    async (importFiles: readonly ImportFile[]) => {
+      const currentApi = apiRef.current;
+      if (!currentApi || importFiles.length === 0) {
+        return;
+      }
+
+      await stageCurrentSceneForImport();
+
+      const sceneFiles = importFiles.filter(isSceneImport);
+      const libraryFiles = importFiles.filter(isLibraryImport);
+      const imageFiles = importFiles.filter(isImageImport);
+
+      if (importFiles.length === 1 && sceneFiles.length === 1) {
+        const scene = await loadSceneFromBlobData(
+          sceneFiles[0].blob,
+          libraryItemsRef.current,
+        );
+
+        currentSavedSceneRef.current = null;
+        await applySceneData(
+          {
+            ...scene,
+            libraryItems: libraryItemsRef.current,
+          },
+          `Opened ${sceneFiles[0].name}`,
+        );
+        return;
+      }
+
+      let copiedScenes = 0;
+      let mergedLibraries = 0;
+      let insertedImages = 0;
+
+      for (const sceneFile of sceneFiles) {
+        await saveImportedSceneFile(sceneFile.name, await sceneFile.blob.text());
+        copiedScenes += 1;
+      }
+
+      for (const libraryFile of libraryFiles) {
+        const nextLibraryItems = (await currentApi.updateLibrary({
+          libraryItems: libraryFile.blob,
+          merge: true,
+          prompt: false,
+        })) as LibraryItems;
+
+        setLibraryItems(nextLibraryItems);
+        libraryItemsRef.current = nextLibraryItems;
+        await persistLibrary(nextLibraryItems);
+        await saveImportedLibraryFile(libraryFile.name, await libraryFile.blob.text());
+        mergedLibraries += 1;
+      }
+
+      insertedImages = await insertImageFiles(imageFiles);
+
+      const summary = [
+        copiedScenes ? `${copiedScenes} canvas file${copiedScenes === 1 ? "" : "s"}` : "",
+        mergedLibraries
+          ? `${mergedLibraries} librar${mergedLibraries === 1 ? "y" : "ies"}`
+          : "",
+        insertedImages ? `${insertedImages} image${insertedImages === 1 ? "" : "s"}` : "",
+      ].filter(Boolean);
+
+      if (summary.length) {
+        showToast(`Imported ${summary.join(", ")}`);
+        await refreshSavedScenesRef.current?.();
+      } else {
+        showToast("No supported files found");
+      }
+    },
+    [
+      applySceneData,
+      insertImageFiles,
+      showToast,
+      stageCurrentSceneForImport,
+    ],
+  );
 
   const handlePendingOpen = useCallback(
     async (pendingOpen: PendingOpenPayload) => {
@@ -515,40 +821,28 @@ function App() {
       }
 
       try {
-        await stageCurrentSceneForImport();
+        const importFiles = pendingOpenFiles(pendingOpen).map((file) => {
+          const fallbackMimeType = isLibraryImport(file)
+            ? MIME_TYPES.excalidrawlib
+            : isImageImport(file)
+            ? file.mimeType || MIME_TYPES.binary
+            : MIME_TYPES.excalidraw;
 
-        if (pendingOpen.name.endsWith(".excalidrawlib")) {
-          const importedLibrary = (await loadLibraryFromBlob(
-            pendingOpenToBlob(pendingOpen, MIME_TYPES.excalidrawlib),
-          )) as LibraryItems;
-          setLibraryItems(importedLibrary);
-          libraryItemsRef.current = importedLibrary;
-          await persistLibrary(importedLibrary);
-          await Promise.resolve(
-            currentApi.updateLibrary({ libraryItems: importedLibrary }),
-          );
-          showToast(`Imported library from ${pendingOpen.name}`);
-          return;
-        }
+          const blob = pendingOpenToBlob(file, fallbackMimeType);
+          return {
+            name: file.name,
+            mimeType: file.mimeType || fallbackMimeType,
+            blob,
+            size: file.size ?? blob.size,
+          };
+        });
 
-        const scene = await loadFromBlob(
-          pendingOpenToBlob(pendingOpen, MIME_TYPES.excalidraw),
-          currentApi.getAppState(),
-          currentApi.getSceneElementsIncludingDeleted(),
-        );
-
-        await applySceneData(
-          {
-            ...scene,
-            libraryItems: libraryItemsRef.current,
-          },
-          `Opened ${pendingOpen.name}`,
-        );
+        await processImportFiles(importFiles);
       } catch {
         showToast(`Could not open ${pendingOpen.name}`);
       }
     },
-    [applySceneData, showToast, stageCurrentSceneForImport],
+    [processImportFiles, showToast],
   );
 
   const applyStylusSnapshot = useCallback((snapshot: NativeStylusSnapshot | null) => {
@@ -707,6 +1001,39 @@ function App() {
     setObjectsSnapModeEnabled(nextValue);
   }, [objectsSnapModeEnabled]);
 
+  const syncPageViewportFromAppState = useCallback((appState: AppState) => {
+    if (!isPageTemplateEnabled(pageSettingsRef.current)) {
+      if (pageViewportRef.current) {
+        pageViewportRef.current = null;
+        setPageViewport(null);
+      }
+      return;
+    }
+
+    const nextViewport: PageViewport = {
+      scrollX: appState.scrollX,
+      scrollY: appState.scrollY,
+      width: appState.width,
+      height: appState.height,
+      zoom: appState.zoom?.value || 1,
+    };
+    const currentViewport = pageViewportRef.current;
+
+    if (
+      currentViewport &&
+      currentViewport.scrollX === nextViewport.scrollX &&
+      currentViewport.scrollY === nextViewport.scrollY &&
+      currentViewport.width === nextViewport.width &&
+      currentViewport.height === nextViewport.height &&
+      currentViewport.zoom === nextViewport.zoom
+    ) {
+      return;
+    }
+
+    pageViewportRef.current = nextViewport;
+    setPageViewport(nextViewport);
+  }, []);
+
   const handlePointerUpdate = useCallback(
     (payload: {
       pointer: { x: number; y: number; tool: "pointer" | "laser" };
@@ -754,6 +1081,7 @@ function App() {
       setViewModeEnabled(appState.viewModeEnabled);
       setGridModeEnabled(appState.gridModeEnabled);
       setObjectsSnapModeEnabled(appState.objectsSnapModeEnabled);
+      syncPageViewportFromAppState(appState);
 
       if (suppressStraightenPassRef.current) {
         suppressStraightenPassRef.current = false;
@@ -839,7 +1167,7 @@ function App() {
 
       scheduleAutosave();
     },
-    [scheduleAutosave],
+    [scheduleAutosave, syncPageViewportFromAppState],
   );
 
   useEffect(() => {
@@ -847,7 +1175,14 @@ function App() {
 
     const bootstrap = async () => {
       const pendingOpen = await getPendingOpenSafe();
-      const nextBootstrap = await loadAppBootstrap(pendingOpen);
+      const deferPendingOpen = shouldDeferPendingOpen(pendingOpen);
+      if (deferPendingOpen) {
+        deferredPendingOpenRef.current = pendingOpen;
+      }
+
+      const nextBootstrap = await loadAppBootstrap(
+        deferPendingOpen ? null : pendingOpen,
+      );
       await clearPendingOpenSafe();
 
       if (cancelled) {
@@ -858,10 +1193,12 @@ function App() {
       setLibraryItems(nextBootstrap.libraryItems);
       setRecents(nextBootstrap.recents);
       setSettings(nextBootstrap.settings);
+      setPageSettings(nextBootstrap.pageSettings);
       setBootstrapNotice(nextBootstrap.importNotice ?? null);
       libraryItemsRef.current = nextBootstrap.libraryItems;
       recentsRef.current = nextBootstrap.recents;
       settingsRef.current = nextBootstrap.settings;
+      pageSettingsRef.current = nextBootstrap.pageSettings;
       setBootstrapped(true);
       await SplashScreen.hide().catch(() => undefined);
     };
@@ -881,6 +1218,16 @@ function App() {
     showToast(bootstrapNotice);
     setBootstrapNotice(null);
   }, [api, bootstrapNotice, showToast]);
+
+  useEffect(() => {
+    if (!api || !bootstrapped || !deferredPendingOpenRef.current) {
+      return;
+    }
+
+    const pendingOpen = deferredPendingOpenRef.current;
+    deferredPendingOpenRef.current = null;
+    void handlePendingOpen(pendingOpen);
+  }, [api, bootstrapped, handlePendingOpen]);
 
   useEffect(() => {
     if (!bootstrapped || !api || !initialData) {
@@ -1001,43 +1348,126 @@ function App() {
       if (autosaveTimerRef.current) {
         window.clearTimeout(autosaveTimerRef.current);
       }
+      if (toastTimerRef.current) {
+        window.clearTimeout(toastTimerRef.current);
+      }
     };
   }, []);
 
-  const openLocalFile = useCallback(() => {
+  const openFiles = useCallback(() => {
     fileInputRef.current?.click();
   }, []);
 
-  const onLocalFileSelected = useCallback(
-    async (event: React.ChangeEvent<HTMLInputElement>) => {
-      const selectedFile = event.target.files?.[0];
-      event.target.value = "";
+  const openDirectory = useCallback(async () => {
+    if (!isNativePlatform) {
+      openFiles();
+      return;
+    }
 
-      if (!selectedFile || !apiRef.current) {
-        return;
+    const result = await openStorageDirectorySafe();
+    if (result.opened) {
+      return;
+    }
+
+    const reason = result.error?.trim();
+    showToast(
+      reason
+        ? `Could not open Excalidraw directory: ${reason}`
+        : "Could not open Excalidraw directory",
+    );
+  }, [openFiles, showToast]);
+
+  const hydrateSavedSceneThumbnails = useCallback(
+    async (savedScenes: SavedSceneFile[]) => {
+      const { exportToBlob } = await import("@excalidraw/excalidraw");
+
+      for (const savedScene of savedScenes) {
+        try {
+          const cachedThumbnail = await getSavedSceneThumbnail(savedScene);
+          if (cachedThumbnail) {
+            setSavedCanvasFiles((currentFiles) =>
+              currentFiles.map((currentFile) =>
+                currentFile.path === savedScene.path &&
+                currentFile.location === savedScene.location
+                  ? { ...currentFile, thumbnailUri: cachedThumbnail }
+                  : currentFile,
+              ),
+            );
+            continue;
+          }
+
+          const scene = await loadSceneFromSavedDeviceFile(savedScene, []);
+          const elements = (
+            (scene.elements as readonly OrderedExcalidrawElement[] | undefined) ??
+            []
+          ).filter((element) => !element.isDeleted);
+
+          if (elements.length === 0) {
+            continue;
+          }
+
+          const blob = await exportToBlob({
+            elements: elements as never,
+            appState: scene.appState,
+            files: (scene.files ?? {}) as BinaryFiles,
+            maxWidthOrHeight: 220,
+            exportPadding: 12,
+            mimeType: MIME_TYPES.png,
+          });
+          const thumbnailUri = await blobToDataUrl(blob);
+          await persistSavedSceneThumbnail(savedScene, thumbnailUri);
+          setSavedCanvasFiles((currentFiles) =>
+            currentFiles.map((currentFile) =>
+              currentFile.path === savedScene.path &&
+              currentFile.location === savedScene.location
+                ? {
+                    ...currentFile,
+                    thumbnailUri,
+                    elementCount: elements.length,
+                  }
+                : currentFile,
+            ),
+          );
+        } catch {
+          // Thumbnail generation is best-effort and should not block the manager.
+        }
       }
+    },
+    [],
+  );
 
+  const refreshSavedScenes = useCallback(async () => {
+    setCanvasDirectoryLoading(true);
+
+    try {
+      const savedScenes = await listSavedScenesFromDevice();
+      setSavedCanvasFiles(savedScenes);
+      void hydrateSavedSceneThumbnails(savedScenes);
+    } catch {
+      setSavedCanvasFiles([]);
+      showToast("Could not open Excalidraw/canvases");
+    } finally {
+      setCanvasDirectoryLoading(false);
+    }
+  }, [hydrateSavedSceneThumbnails, showToast]);
+
+  refreshSavedScenesRef.current = refreshSavedScenes;
+
+  const openCanvas = useCallback(async () => {
+    setCanvasDirectoryOpen(true);
+    setActiveTimelineScene(null);
+    setCanvasVersions([]);
+    await refreshSavedScenes();
+  }, [refreshSavedScenes]);
+
+  const openSavedCanvas = useCallback(
+    async (savedScene: SavedSceneFile) => {
       try {
         await stageCurrentSceneForImport();
 
-        if (selectedFile.name.endsWith(".excalidrawlib")) {
-          const importedLibrary = (await loadLibraryFromBlob(
-            selectedFile,
-          )) as LibraryItems;
-          setLibraryItems(importedLibrary);
-          libraryItemsRef.current = importedLibrary;
-          await persistLibrary(importedLibrary);
-          await Promise.resolve(
-            apiRef.current.updateLibrary({ libraryItems: importedLibrary }),
-          );
-          showToast(`Imported library from ${selectedFile.name}`);
-          return;
-        }
-
-        const scene = await loadFromBlob(
-          selectedFile,
-          apiRef.current.getAppState(),
-          apiRef.current.getSceneElementsIncludingDeleted(),
+        const scene = await loadSceneFromSavedDeviceFile(
+          savedScene,
+          libraryItemsRef.current,
         );
 
         await applySceneData(
@@ -1045,13 +1475,43 @@ function App() {
             ...scene,
             libraryItems: libraryItemsRef.current,
           },
-          `Opened ${selectedFile.name}`,
+          `Opened ${savedScene.name}`,
         );
+
+        currentSavedSceneRef.current = savedScene;
+        hasMeaningfulChangeRef.current = false;
+        setCanvasDirectoryOpen(false);
+        setActiveTimelineScene(null);
       } catch {
-        showToast(`Could not open ${selectedFile.name}`);
+        showToast(`Could not open ${savedScene.name}`);
       }
     },
     [applySceneData, showToast, stageCurrentSceneForImport],
+  );
+
+  const onLocalFileSelected = useCallback(
+    async (event: React.ChangeEvent<HTMLInputElement>) => {
+      const selectedFiles = Array.from(event.target.files ?? []);
+      event.target.value = "";
+
+      if (selectedFiles.length === 0 || !apiRef.current) {
+        return;
+      }
+
+      try {
+        await processImportFiles(
+          selectedFiles.map((file) => ({
+            name: file.name,
+            mimeType: file.type,
+            blob: file,
+            size: file.size,
+          })),
+        );
+      } catch {
+        showToast("Could not import selected files");
+      }
+    },
+    [processImportFiles, showToast],
   );
 
   const saveSceneCopy = useCallback(async () => {
@@ -1060,19 +1520,52 @@ function App() {
       return;
     }
 
-    const payload = createScenePayload(currentApi);
-    const savedExport = await saveTextExport(
-      suggestedFilename(makeSceneTitle(payload.appState.name), ".excalidraw"),
-      serializeScene(payload),
-      MIME_TYPES.excalidraw,
-    );
+    try {
+      const payload = createScenePayload(currentApi);
+      const defaultFilename = suggestedFilename(
+        makeSceneTitle(payload.appState.name),
+        ".excalidraw",
+      );
+      const requestedFilename =
+        typeof window.prompt === "function"
+          ? window.prompt("Save to device as:", defaultFilename)
+          : defaultFilename;
 
-    showToast(
-      savedExport.downloaded
-        ? `Downloaded ${savedExport.filename}`
-        : `Saved ${savedExport.filename}`,
-    );
-  }, [showToast]);
+      if (requestedFilename === null) {
+        showToast("Save canceled");
+        return;
+      }
+
+      const filenameSource = requestedFilename.trim() || defaultFilename;
+      const savedExport = await saveTextExport(
+        suggestedFilename(filenameSource, ".excalidraw"),
+        serializeScene(payload, pageSettingsRef.current),
+        MIME_TYPES.excalidraw,
+      );
+
+      if (!savedExport.downloaded) {
+        const savedScenes = await listSavedScenesFromDevice().catch(() => []);
+        currentSavedSceneRef.current =
+          savedScenes.find((savedScene) => savedScene.path === savedExport.path) ??
+          savedScenes.find((savedScene) => savedScene.name === savedExport.filename) ??
+          null;
+        if (canvasDirectoryOpen) {
+          setSavedCanvasFiles(savedScenes);
+          void hydrateSavedSceneThumbnails(savedScenes);
+        }
+      }
+
+      showToast(
+        savedExport.downloaded
+          ? `Downloaded ${savedExport.filename}`
+          : `Saved to ${savedExport.path}`,
+      );
+    } catch (error) {
+      const reason =
+        error instanceof Error && error.message ? ` (${error.message})` : "";
+      showToast(`Could not save this scene${reason}`);
+    }
+  }, [canvasDirectoryOpen, hydrateSavedSceneThumbnails, showToast]);
 
   const shareSceneCopy = useCallback(async () => {
     const currentApi = apiRef.current;
@@ -1080,33 +1573,41 @@ function App() {
       return;
     }
 
-    const payload = createScenePayload(currentApi);
-    const savedExport = await saveTextExport(
-      suggestedFilename(makeSceneTitle(payload.appState.name), ".excalidraw"),
-      serializeScene(payload),
-      MIME_TYPES.excalidraw,
-    );
+    try {
+      const payload = createScenePayload(currentApi);
+      const savedExport = await saveTextExport(
+        suggestedFilename(makeSceneTitle(payload.appState.name), ".excalidraw"),
+        serializeScene(payload, pageSettingsRef.current),
+        MIME_TYPES.excalidraw,
+      );
 
-    if (!savedExport.uri) {
-      showToast(`Downloaded ${savedExport.filename}`);
-      return;
+      if (!savedExport.uri) {
+        showToast(`Downloaded ${savedExport.filename}`);
+        return;
+      }
+
+      await shareSavedExport(savedExport, "Share Escalidraw scene");
+    } catch {
+      showToast("Could not prepare scene for sharing");
     }
-
-    await shareSavedExport(savedExport, "Share Escalidraw scene");
   }, [showToast]);
 
   const exportLibrary = useCallback(async () => {
-    const savedExport = await saveTextExport(
-      suggestedFilename(`${makeSceneTitle(sceneName)}-library`, ".excalidrawlib"),
-      serializeLibrary(libraryItemsRef.current),
-      MIME_TYPES.excalidrawlib,
-    );
+    try {
+      const savedExport = await saveTextExport(
+        suggestedFilename(`${makeSceneTitle(sceneName)}-library`, ".excalidrawlib"),
+        serializeLibrary(libraryItemsRef.current),
+        MIME_TYPES.excalidrawlib,
+      );
 
-    showToast(
-      savedExport.downloaded
-        ? `Downloaded ${savedExport.filename}`
-        : `Saved ${savedExport.filename}`,
-    );
+      showToast(
+        savedExport.downloaded
+          ? `Downloaded ${savedExport.filename}`
+          : `Saved to ${savedExport.path}`,
+      );
+    } catch {
+      showToast("Could not export the library");
+    }
   }, [sceneName, showToast]);
 
   const exportPng = useCallback(async () => {
@@ -1115,24 +1616,30 @@ function App() {
       return;
     }
 
-    const exportPayload = createExportPayload(currentApi);
-    const blob = await exportToBlob({
-      elements: exportPayload.elements,
-      appState: exportPayload.appState,
-      files: exportPayload.files,
-      mimeType: MIME_TYPES.png,
-    });
+    try {
+      const { exportToBlob } = await import("@excalidraw/excalidraw");
 
-    const savedExport = await saveBlobExport(
-      suggestedFilename(makeSceneTitle(exportPayload.appState.name), ".png"),
-      blob,
-    );
+      const exportPayload = createExportPayload(currentApi);
+      const blob = await exportToBlob({
+        elements: exportPayload.elements,
+        appState: exportPayload.appState,
+        files: exportPayload.files,
+        mimeType: MIME_TYPES.png,
+      });
 
-    showToast(
-      savedExport.downloaded
-        ? `Downloaded ${savedExport.filename}`
-        : `Saved ${savedExport.filename}`,
-    );
+      const savedExport = await saveBlobExport(
+        suggestedFilename(makeSceneTitle(exportPayload.appState.name), ".png"),
+        blob,
+      );
+
+      showToast(
+        savedExport.downloaded
+          ? `Downloaded ${savedExport.filename}`
+          : `Saved to ${savedExport.path}`,
+      );
+    } catch {
+      showToast("Could not export PNG");
+    }
   }, [showToast]);
 
   const exportSvg = useCallback(async () => {
@@ -1141,23 +1648,59 @@ function App() {
       return;
     }
 
-    const exportPayload = createExportPayload(currentApi);
-    const svgElement = await exportToSvg({
-      elements: exportPayload.elements,
-      appState: exportPayload.appState,
-      files: exportPayload.files,
-    });
+    try {
+      const { exportToSvg } = await import("@excalidraw/excalidraw");
 
-    const savedExport = await saveBlobExport(
-      suggestedFilename(makeSceneTitle(exportPayload.appState.name), ".svg"),
-      new Blob([svgElement.outerHTML], { type: MIME_TYPES.svg }),
-    );
+      const exportPayload = createExportPayload(currentApi);
+      const svgElement = await exportToSvg({
+        elements: exportPayload.elements,
+        appState: exportPayload.appState,
+        files: exportPayload.files,
+      });
 
-    showToast(
-      savedExport.downloaded
-        ? `Downloaded ${savedExport.filename}`
-        : `Saved ${savedExport.filename}`,
-    );
+      const savedExport = await saveBlobExport(
+        suggestedFilename(makeSceneTitle(exportPayload.appState.name), ".svg"),
+        new Blob([svgElement.outerHTML], { type: MIME_TYPES.svg }),
+      );
+
+      showToast(
+        savedExport.downloaded
+          ? `Downloaded ${savedExport.filename}`
+          : `Saved to ${savedExport.path}`,
+      );
+    } catch {
+      showToast("Could not export SVG");
+    }
+  }, [showToast]);
+
+  const exportPdf = useCallback(async () => {
+    const currentApi = apiRef.current;
+    if (!currentApi) {
+      return;
+    }
+
+    try {
+      const { createA4PdfBlob } = await import("./lib/pdfExport");
+      const exportPayload = createExportPayload(currentApi);
+      const blob = await createA4PdfBlob(exportPayload, pageSettingsRef.current);
+      const savedExport = await saveBlobExport(
+        suggestedFilename(
+          `${makeSceneTitle(exportPayload.appState.name)}-${formatExportTimestamp(
+            new Date(),
+          )}`,
+          ".pdf",
+        ),
+        blob,
+      );
+
+      showToast(
+        savedExport.downloaded
+          ? `Downloaded ${savedExport.filename}`
+          : `Saved to ${savedExport.path}`,
+      );
+    } catch {
+      showToast("Could not export PDF");
+    }
   }, [showToast]);
 
   const restoreLatestAutosave = useCallback(async () => {
@@ -1177,6 +1720,189 @@ function App() {
       showToast("Latest recovery snapshot is unavailable");
     }
   }, [applySceneData, showToast]);
+
+  const applyTemplate = useCallback(
+    async (template: CanvasTemplate) => {
+      try {
+        await stageCurrentSceneForImport();
+        currentSavedSceneRef.current = null;
+        await applySceneData(template.initialData, `Created ${template.name}`);
+        setTemplatePickerOpen(false);
+      } catch {
+        showToast(`Could not apply ${template.name}`);
+      }
+    },
+    [applySceneData, showToast, stageCurrentSceneForImport],
+  );
+
+  const updatePageSettings = useCallback(
+    (nextPageSettings: PageSettings) => {
+      setPageSettings(nextPageSettings);
+      pageSettingsRef.current = nextPageSettings;
+      if (isPageTemplateEnabled(nextPageSettings)) {
+        const appState = apiRef.current?.getAppState();
+        if (appState) {
+          syncPageViewportFromAppState(appState);
+        }
+      } else if (pageViewportRef.current) {
+        pageViewportRef.current = null;
+        setPageViewport(null);
+      }
+      hasMeaningfulChangeRef.current = true;
+      scheduleAutosave();
+      showToast(`Page template: ${getPageTemplateOption(nextPageSettings.template).name}`);
+    },
+    [scheduleAutosave, showToast, syncPageViewportFromAppState],
+  );
+
+  const renameCanvas = useCallback(
+    async (savedScene: SavedSceneFile) => {
+      const requestedName = window.prompt("Rename canvas:", savedScene.name);
+      if (requestedName === null) {
+        return;
+      }
+
+      try {
+        const renamedScene = await renameSavedScene(savedScene, requestedName);
+        if (
+          currentSavedSceneRef.current?.path === savedScene.path &&
+          currentSavedSceneRef.current.location === savedScene.location
+        ) {
+          currentSavedSceneRef.current = renamedScene;
+        }
+        showToast(`Renamed to ${renamedScene.name}`);
+        await refreshSavedScenes();
+      } catch (error) {
+        const reason =
+          error instanceof Error && error.message ? ` (${error.message})` : "";
+        showToast(`Could not rename canvas${reason}`);
+      }
+    },
+    [refreshSavedScenes, showToast],
+  );
+
+  const duplicateCanvas = useCallback(
+    async (savedScene: SavedSceneFile) => {
+      try {
+        const duplicatedScene = await duplicateSavedScene(savedScene);
+        showToast(`Duplicated ${duplicatedScene.name}`);
+        await refreshSavedScenes();
+      } catch {
+        showToast(`Could not duplicate ${savedScene.name}`);
+      }
+    },
+    [refreshSavedScenes, showToast],
+  );
+
+  const deleteCanvas = useCallback(
+    async (savedScene: SavedSceneFile) => {
+      if (!window.confirm(`Delete ${savedScene.name}?`)) {
+        return;
+      }
+
+      try {
+        const deleteSummary = await deleteSavedScene(savedScene);
+        if (
+          currentSavedSceneRef.current?.path === savedScene.path &&
+          currentSavedSceneRef.current.location === savedScene.location
+        ) {
+          currentSavedSceneRef.current = null;
+        }
+        setSavedCanvasFiles((currentFiles) =>
+          currentFiles.filter((currentFile) => currentFile.name !== savedScene.name),
+        );
+        setActiveTimelineScene(null);
+        setCanvasVersions([]);
+        showToast(
+          deleteSummary.deleted > 1
+            ? `Deleted ${savedScene.name} (${deleteSummary.deleted} copies)`
+            : `Deleted ${savedScene.name}`,
+        );
+        await refreshSavedScenes();
+      } catch (error) {
+        const reason =
+          error instanceof Error && error.message ? ` (${error.message})` : "";
+        showToast(`Could not delete ${savedScene.name}${reason}`);
+      }
+    },
+    [refreshSavedScenes, showToast],
+  );
+
+  const openCanvasTimeline = useCallback(
+    async (savedScene: SavedSceneFile) => {
+      setActiveTimelineScene(savedScene);
+      setCanvasVersions([]);
+      setCanvasVersionsLoading(true);
+
+      try {
+        setCanvasVersions(await listCanvasVersions(savedScene));
+      } catch {
+        showToast(`Could not load timeline for ${savedScene.name}`);
+      } finally {
+        setCanvasVersionsLoading(false);
+      }
+    },
+    [showToast],
+  );
+
+  const restoreCanvasFromTimeline = useCallback(
+    async (savedScene: SavedSceneFile, version: CanvasVersionMeta) => {
+      if (!window.confirm(`Restore ${savedScene.name} from this version?`)) {
+        return;
+      }
+
+      try {
+        const scene = await restoreCanvasVersion(
+          savedScene,
+          version.id,
+          libraryItemsRef.current,
+        );
+        await applySceneData(scene, `Restored ${savedScene.name}`);
+        currentSavedSceneRef.current = savedScene;
+        await refreshSavedScenes();
+        await openCanvasTimeline(savedScene);
+      } catch {
+        showToast(`Could not restore ${savedScene.name}`);
+      }
+    },
+    [applySceneData, openCanvasTimeline, refreshSavedScenes, showToast],
+  );
+
+  const exportBackup = useCallback(async () => {
+    setBackupBusy(true);
+    try {
+      const savedBackup = await createBackupZip();
+      showToast(
+        savedBackup.downloaded
+          ? `Downloaded ${savedBackup.filename}`
+          : `Saved to ${savedBackup.path}`,
+      );
+    } catch {
+      showToast("Could not create backup");
+    } finally {
+      setBackupBusy(false);
+    }
+  }, [showToast]);
+
+  const restoreBackup = useCallback(
+    async (file: File) => {
+      setBackupBusy(true);
+      try {
+        const summary = await restoreBackupZip(file);
+        showToast(
+          `Restored ${summary.restored} file${summary.restored === 1 ? "" : "s"}`,
+        );
+        await refreshSavedScenes();
+      } catch (error) {
+        const reason =
+          error instanceof Error && error.message ? ` (${error.message})` : "";
+        showToast(`Could not restore backup${reason}`);
+      } finally {
+        setBackupBusy(false);
+      }
+    },
+    [refreshSavedScenes, showToast],
+  );
 
   if (!bootstrapped || !initialData) {
     return (
@@ -1200,13 +1926,79 @@ function App() {
         ref={fileInputRef}
         className="draw-hidden-input"
         type="file"
-        accept=".excalidraw,.excalidrawlib,application/json"
+        accept=".excalidraw,.excalidrawlib,.json,application/json,image/*,*/*"
+        multiple
         onChange={onLocalFileSelected}
       />
 
+      {canvasDirectoryOpen ? (
+        <CanvasManagerModal
+          activeTimelineScene={activeTimelineScene}
+          loading={canvasDirectoryLoading}
+          savedScenes={savedCanvasFiles}
+          versions={canvasVersions}
+          versionsLoading={canvasVersionsLoading}
+          onClose={() => setCanvasDirectoryOpen(false)}
+          onDelete={(savedScene) => {
+            void deleteCanvas(savedScene);
+          }}
+          onDuplicate={(savedScene) => {
+            void duplicateCanvas(savedScene);
+          }}
+          onOpen={(savedScene) => {
+            void openSavedCanvas(savedScene);
+          }}
+          onRefresh={() => {
+            void refreshSavedScenes();
+          }}
+          onRename={(savedScene) => {
+            void renameCanvas(savedScene);
+          }}
+          onRestoreVersion={(savedScene, version) => {
+            void restoreCanvasFromTimeline(savedScene, version);
+          }}
+          onTimeline={(savedScene) => {
+            void openCanvasTimeline(savedScene);
+          }}
+        />
+      ) : null}
+
+      {templatePickerOpen ? (
+        <TemplatePickerModal
+          templates={CANVAS_TEMPLATES}
+          onClose={() => setTemplatePickerOpen(false)}
+          onSelect={(template) => {
+            void applyTemplate(template);
+          }}
+        />
+      ) : null}
+
+      {pageSettingsOpen ? (
+        <PageSettingsModal
+          pageSettings={pageSettings}
+          onClose={() => setPageSettingsOpen(false)}
+          onChange={updatePageSettings}
+        />
+      ) : null}
+
+      {backupCenterOpen ? (
+        <BackupCenterModal
+          busy={backupBusy}
+          onClose={() => setBackupCenterOpen(false)}
+          onExport={() => {
+            void exportBackup();
+          }}
+          onRestore={(file) => {
+            void restoreBackup(file);
+          }}
+        />
+      ) : null}
+
+      <PageTemplateOverlay pageSettings={pageSettings} viewport={pageViewport} />
+
       <Excalidraw
         initialData={initialData}
-        excalidrawAPI={setApi}
+        onExcalidrawAPI={setApi}
         onChange={handleChange}
         onPointerUpdate={handlePointerUpdate}
         onLibraryChange={handleLibraryChange}
@@ -1214,12 +2006,10 @@ function App() {
         handleKeyboardGlobally
         UIOptions={{
           canvasActions: {
-            loadScene: true,
-            saveToActiveFile: true,
-            saveAsImage: true,
-            export: {
-              saveFileToDisk: true,
-            },
+            loadScene: false,
+            saveToActiveFile: false,
+            saveAsImage: false,
+            export: false,
             clearCanvas: true,
             changeViewBackgroundColor: true,
             toggleTheme: true,
@@ -1232,13 +2022,20 @@ function App() {
         <WelcomeScreen />
         <DrawMainMenu
           exportLibrary={exportLibrary}
+          exportPdf={exportPdf}
           exportPng={exportPng}
           exportSvg={exportSvg}
           gridModeEnabled={gridModeEnabled}
           lastAutosavedAt={lastAutosavedAt}
           nativeStylus={nativeStylus}
           objectsSnapModeEnabled={objectsSnapModeEnabled}
-          openLocalFile={openLocalFile}
+          openBackupCenter={() => setBackupCenterOpen(true)}
+          openCanvas={openCanvas}
+          openFiles={openFiles}
+          openDirectory={openDirectory}
+          openPageSettings={() => setPageSettingsOpen(true)}
+          openTemplates={() => setTemplatePickerOpen(true)}
+          pageSettings={pageSettings}
           penDetected={penDetected}
           penMode={penMode}
           recentsCount={recents.length}
@@ -1259,184 +2056,6 @@ function App() {
         />
       </Excalidraw>
     </div>
-  );
-}
-
-type DrawMainMenuProps = {
-  openLocalFile: () => void;
-  saveSceneCopy: () => Promise<void>;
-  shareSceneCopy: () => Promise<void>;
-  exportLibrary: () => Promise<void>;
-  exportPng: () => Promise<void>;
-  exportSvg: () => Promise<void>;
-  restoreLatestAutosave: () => Promise<void>;
-  theme: Theme;
-  penMode: boolean;
-  penDetected: boolean;
-  settings: DrawSettings;
-  zenModeEnabled: boolean;
-  viewModeEnabled: boolean;
-  gridModeEnabled: boolean;
-  objectsSnapModeEnabled: boolean;
-  lastAutosavedAt: string | null;
-  recentsCount: number;
-  nativeStylus: NativeStylusSnapshot | null;
-  toggleTheme: () => void;
-  toggleZenMode: () => void;
-  toggleViewMode: () => void;
-  toggleGridMode: () => void;
-  toggleSnapMode: () => void;
-  updatePenMode: (nextPenMode: boolean) => Promise<void>;
-  updateStylusBridgePreference: (enabled: boolean) => Promise<void>;
-};
-
-function DrawMainMenu(props: DrawMainMenuProps) {
-  return (
-    <MainMenu>
-      <MainMenu.DefaultItems.LoadScene />
-      <MainMenu.DefaultItems.SaveToActiveFile />
-      <MainMenu.DefaultItems.SaveAsImage />
-      <MainMenu.DefaultItems.Export />
-      <MainMenu.DefaultItems.CommandPalette />
-      <MainMenu.DefaultItems.SearchMenu />
-      <MainMenu.Separator />
-      <MainMenu.ItemCustom>
-        <div className="draw-menu-section-title">File Actions</div>
-      </MainMenu.ItemCustom>
-      <MainMenu.ItemCustom>
-        <button className="draw-menu-button" type="button" onClick={props.openLocalFile}>
-          <span className="draw-menu-button-label">Open `.excalidraw` / library file</span>
-        </button>
-      </MainMenu.ItemCustom>
-      <MainMenu.ItemCustom>
-        <button className="draw-menu-button" type="button" onClick={props.saveSceneCopy}>
-          <span className="draw-menu-button-label">Save scene copy to device</span>
-        </button>
-      </MainMenu.ItemCustom>
-      <MainMenu.ItemCustom>
-        <button className="draw-menu-button" type="button" onClick={props.shareSceneCopy}>
-          <span className="draw-menu-button-label">Share current scene</span>
-        </button>
-      </MainMenu.ItemCustom>
-      <MainMenu.ItemCustom>
-        <button className="draw-menu-button" type="button" onClick={props.exportPng}>
-          <span className="draw-menu-button-label">Export PNG to device</span>
-        </button>
-      </MainMenu.ItemCustom>
-      <MainMenu.ItemCustom>
-        <button className="draw-menu-button" type="button" onClick={props.exportSvg}>
-          <span className="draw-menu-button-label">Export SVG to device</span>
-        </button>
-      </MainMenu.ItemCustom>
-      <MainMenu.ItemCustom>
-        <button className="draw-menu-button" type="button" onClick={props.exportLibrary}>
-          <span className="draw-menu-button-label">Export library</span>
-        </button>
-      </MainMenu.ItemCustom>
-      <MainMenu.ItemCustom>
-        <button
-          className="draw-menu-button"
-          type="button"
-          onClick={props.restoreLatestAutosave}
-        >
-          <span className="draw-menu-button-label">Restore latest recovery snapshot</span>
-          <span className="draw-menu-button-meta">{props.recentsCount} saved</span>
-        </button>
-      </MainMenu.ItemCustom>
-
-      <MainMenu.Separator />
-      <MainMenu.ItemCustom>
-        <div className="draw-menu-section-title">Options</div>
-      </MainMenu.ItemCustom>
-
-      <MainMenu.ItemCustom>
-        <button className="draw-menu-button" type="button" onClick={props.toggleTheme}>
-          <span className="draw-menu-button-label">Dark mode</span>
-          <span className="draw-menu-badge">{onOffLabel(props.theme === "dark")}</span>
-        </button>
-      </MainMenu.ItemCustom>
-
-      <MainMenu.ItemCustom>
-        <button className="draw-menu-button" type="button" onClick={props.toggleZenMode}>
-          <span className="draw-menu-button-label">Zen canvas mode</span>
-          <span className="draw-menu-badge">{onOffLabel(props.zenModeEnabled)}</span>
-        </button>
-      </MainMenu.ItemCustom>
-
-      <MainMenu.ItemCustom>
-        <button className="draw-menu-button" type="button" onClick={props.toggleViewMode}>
-          <span className="draw-menu-button-label">View-only mode</span>
-          <span className="draw-menu-badge">{onOffLabel(props.viewModeEnabled)}</span>
-        </button>
-      </MainMenu.ItemCustom>
-
-      <MainMenu.ItemCustom>
-        <button className="draw-menu-button" type="button" onClick={props.toggleGridMode}>
-          <span className="draw-menu-button-label">Grid overlay</span>
-          <span className="draw-menu-badge">{onOffLabel(props.gridModeEnabled)}</span>
-        </button>
-      </MainMenu.ItemCustom>
-
-      <MainMenu.ItemCustom>
-        <button className="draw-menu-button" type="button" onClick={props.toggleSnapMode}>
-          <span className="draw-menu-button-label">Object snap</span>
-          <span className="draw-menu-badge">
-            {onOffLabel(props.objectsSnapModeEnabled)}
-          </span>
-        </button>
-      </MainMenu.ItemCustom>
-
-      <MainMenu.ItemCustom>
-        <button
-          className="draw-menu-button"
-          type="button"
-          onClick={() => {
-            void props.updatePenMode(!props.penMode);
-          }}
-        >
-          <span className="draw-menu-button-label">Stylus mode</span>
-          <span className="draw-menu-badge">{onOffLabel(props.penMode)}</span>
-        </button>
-      </MainMenu.ItemCustom>
-
-      <MainMenu.ItemCustom>
-        <button
-          className="draw-menu-button"
-          type="button"
-          onClick={() => {
-            void props.updateStylusBridgePreference(
-              !props.settings.preferNativeStylusBridge,
-            );
-          }}
-        >
-          <span className="draw-menu-button-label">Native stylus bridge</span>
-          <span className="draw-menu-badge">
-            {onOffLabel(props.settings.preferNativeStylusBridge)}
-          </span>
-        </button>
-      </MainMenu.ItemCustom>
-
-      <MainMenu.ItemCustom>
-        <div className="draw-menu-status-card">
-          <div>
-            <span>Last autosave</span>
-            <strong>{formatTimestamp(props.lastAutosavedAt)}</strong>
-          </div>
-          <div>
-            <span>Pen detected</span>
-            <strong>{props.penDetected ? "Yes" : "No"}</strong>
-          </div>
-          <div>
-            <span>Native tool</span>
-            <strong>{props.nativeStylus?.toolType ?? "Unavailable"}</strong>
-          </div>
-        </div>
-      </MainMenu.ItemCustom>
-
-      <MainMenu.Separator />
-      <MainMenu.DefaultItems.ClearCanvas />
-      <MainMenu.DefaultItems.Help />
-    </MainMenu>
   );
 }
 

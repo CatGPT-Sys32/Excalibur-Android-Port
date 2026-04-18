@@ -1,0 +1,66 @@
+{
+  "name": "@excalidraw/math",
+  "version": "0.18.0",
+  "type": "module",
+  "types": "./dist/types/math/src/index.d.ts",
+  "main": "./src/index.ts",
+  "module": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/types/math/src/index.d.ts",
+      "development": "./src/index.ts",
+      "production": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./*": {
+      "types": "./dist/types/math/src/*.d.ts",
+      "development": "./src/*.ts",
+      "production": "./src/*.ts",
+      "default": "./src/*.ts"
+    }
+  },
+  "files": [
+    "dist/*"
+  ],
+  "description": "Excalidraw math functions",
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
+  "keywords": [
+    "excalidraw",
+    "excalidraw-math",
+    "math",
+    "vector",
+    "algebra",
+    "2d"
+  ],
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not ie <= 11",
+      "not op_mini all",
+      "not safari < 12",
+      "not kaios <= 2.5",
+      "not edge < 79",
+      "not chrome < 70",
+      "not and_uc < 13",
+      "not samsung < 10"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "bugs": "https://github.com/excalidraw/excalidraw/issues",
+  "repository": "https://github.com/excalidraw/excalidraw",
+  "scripts": {
+    "gen:types": "rimraf types && tsc",
+    "build:esm": "rimraf dist && node ../../scripts/buildBase.js && yarn gen:types"
+  },
+  "dependencies": {
+    "@excalidraw/common": "file:../common"
+  }
+}

@@ -3,14 +3,19 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const rootDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const sourceDir = resolve(
-  rootDir,
-  "node_modules/@excalidraw/excalidraw/dist/prod",
-);
+const candidateSourceDirs = [
+  resolve(rootDir, "vendor/excalidraw/dist/prod"),
+  resolve(rootDir, "node_modules/@excalidraw/excalidraw/dist/prod"),
+];
+const sourceDir = candidateSourceDirs.find((dir) => existsSync(dir));
 const targetDir = resolve(rootDir, "public/excalidraw-assets");
 
-if (!existsSync(sourceDir)) {
-  console.warn("Excalidraw assets not found yet, skipping sync.");
+if (!sourceDir) {
+  console.warn(
+    `Excalidraw assets not found yet. Looked in: ${candidateSourceDirs.join(
+      ", ",
+    )}. Skipping sync.`,
+  );
   process.exit(0);
 }
 
