@@ -32,6 +32,8 @@ const APP_PATHS = {
   canvasIndex: "canvas-manager/index.json",
   thumbnailDir: "canvas-manager/thumbnails",
   versionsDir: "canvas-manager/versions",
+  customTemplateIndex: "templates/custom/index.json",
+  customTemplateDir: "templates/custom/items",
 } as const;
 
 const USER_STORAGE_PATHS = {
@@ -83,6 +85,7 @@ export type BootstrapState = {
   initialData: ExcalidrawInitialDataState | null;
   pageSettings: PageSettings;
   libraryItems: LibraryItems;
+  customTemplates: CustomCanvasTemplate[];
   recents: SceneSnapshotMeta[];
   settings: DrawSettings;
   importNotice?: string;
@@ -107,8 +110,19 @@ export type SavedSceneFile = {
   size: number;
   location: SavedSceneLocation;
   canvasId?: string;
+  pinned?: boolean;
   thumbnailUri?: string | null;
   elementCount?: number;
+};
+
+export type CustomCanvasTemplate = {
+  id: string;
+  name: string;
+  description: string;
+  source: "custom";
+  createdAt: string;
+  updatedAt: string;
+  initialData: ExcalidrawInitialDataState;
 };
 
 export type CanvasVersionMeta = {
@@ -360,8 +374,6 @@ const ensureUserStorageDirectories = async (
 
   if (options.migrateLegacy) {
     await migrateLegacyExternalUserStorage();
-  } else {
-    await markLegacyMigrationComplete();
   }
 };
 
@@ -462,7 +474,14 @@ const writeBinaryFileNative = async (
   await writeBase64FileNative(path, directory, bytesToBase64(bytes));
 };
 
-const getExportTargetPath = (filename: string) => {
+const getExportTargetPath = (
+  filename: string,
+  options: { forceExports?: boolean } = {},
+) => {
+  if (options.forceExports) {
+    return `${USER_STORAGE_PATHS.exportsDir}/${filename}`;
+  }
+
   const extension = extensionFromFilename(filename).toLowerCase();
   if (extension === ".excalidraw") {
     return `${USER_STORAGE_PATHS.canvasesDir}/${filename}`;
@@ -625,7 +644,8 @@ const withPageSettingsMetadata = (
 
   if (
     pageSettings.template === DEFAULT_PAGE_SETTINGS.template &&
-    pageSettings.mode === DEFAULT_PAGE_SETTINGS.mode
+    pageSettings.mode === DEFAULT_PAGE_SETTINGS.mode &&
+    pageSettings.marginMode === DEFAULT_PAGE_SETTINGS.marginMode
   ) {
     delete sceneData[PAGE_SETTINGS_METADATA_KEY];
   } else {
@@ -765,6 +785,7 @@ export const saveTextExport = async (
   filename: string,
   text: string,
   mimeType: string,
+  options: { forceExports?: boolean } = {},
 ): Promise<SavedExport> => {
   if (!isNativePlatform) {
     downloadText(filename, text, mimeType);
@@ -775,7 +796,7 @@ export const saveTextExport = async (
     };
   }
 
-  const path = getExportTargetPath(filename);
+  const path = getExportTargetPath(filename, options);
   await ensureUserStorageDirectories();
   const exportDirectories = getNativeExportDirectories();
   let lastError: unknown = null;
@@ -783,7 +804,10 @@ export const saveTextExport = async (
   for (const directory of exportDirectories) {
     try {
       await ensureNativeDirectory(path, directory);
-      if (extensionFromFilename(filename).toLowerCase() === ".excalidraw") {
+      if (
+        !options.forceExports &&
+        extensionFromFilename(filename).toLowerCase() === ".excalidraw"
+      ) {
         await recordExistingSceneRevision(path, directory).catch(() => undefined);
       }
       await writeTextFileNative(path, directory, text);
@@ -925,11 +949,15 @@ export const listSavedScenesFromDevice = async (): Promise<SavedSceneFile[]> => 
   });
 
   return Promise.all(
-    sortedScenes.map(async (savedScene) => ({
-      ...savedScene,
-      canvasId: await resolveCanvasId(savedScene),
-      thumbnailUri: await getSavedSceneThumbnail(savedScene),
-    })),
+    sortedScenes.map(async (savedScene) => {
+      const indexEntry = await resolveCanvasIndexEntry(savedScene);
+      return {
+        ...savedScene,
+        canvasId: indexEntry.id,
+        pinned: Boolean(indexEntry.pinned),
+        thumbnailUri: await getSavedSceneThumbnail(savedScene),
+      };
+    }),
   );
 };
 
@@ -961,10 +989,22 @@ type CanvasIndexEntry = {
   name: string;
   path: string;
   location: SavedSceneLocation;
+  pinned?: boolean;
   updatedAt: string;
 };
 
 type CanvasIndex = Record<string, CanvasIndexEntry>;
+
+type CustomTemplateIndexEntry = {
+  id: string;
+  name: string;
+  description: string;
+  path: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type CustomTemplateIndex = CustomTemplateIndexEntry[];
 
 type ThumbnailMeta = {
   path: string;
@@ -998,6 +1038,19 @@ const readCanvasIndex = async (): Promise<CanvasIndex> =>
 
 const writeCanvasIndex = async (index: CanvasIndex) => {
   await writeDataText(APP_PATHS.canvasIndex, JSON.stringify(index, null, 2));
+};
+
+const readCustomTemplateIndex = async (): Promise<CustomTemplateIndex> =>
+  safeJsonParse<CustomTemplateIndex>(
+    await readDataText(APP_PATHS.customTemplateIndex),
+    [],
+  );
+
+const writeCustomTemplateIndex = async (index: CustomTemplateIndex) => {
+  await writeDataText(
+    APP_PATHS.customTemplateIndex,
+    JSON.stringify(index, null, 2),
+  );
 };
 
 const resolveCanvasId = async (savedScene: SavedSceneFile) => {
@@ -1035,6 +1088,18 @@ const resolveCanvasId = async (savedScene: SavedSceneFile) => {
   return id;
 };
 
+const resolveCanvasIndexEntry = async (savedScene: SavedSceneFile) => {
+  const canvasId = await resolveCanvasId(savedScene);
+  const index = await readCanvasIndex();
+  return index[savedSceneKey(savedScene)] ?? {
+    id: canvasId,
+    name: savedScene.name,
+    path: savedScene.path,
+    location: savedScene.location,
+    updatedAt: new Date().toISOString(),
+  };
+};
+
 const updateCanvasIndexForRename = async (
   fromScene: SavedSceneFile,
   toScene: SavedSceneFile,
@@ -1051,6 +1116,7 @@ const updateCanvasIndexForRename = async (
     name: toScene.name,
     path: toScene.path,
     location: toScene.location,
+    pinned: existingEntry?.pinned,
     updatedAt: new Date().toISOString(),
   };
   await writeCanvasIndex(index);
@@ -1127,6 +1193,28 @@ export const persistSavedSceneThumbnail = async (
     writeDataText(thumbnailDataPath(savedScene), thumbnailUri),
     writeDataText(thumbnailMetaPath(savedScene), JSON.stringify(meta, null, 2)),
   ]);
+};
+
+export const setSavedScenePinned = async (
+  savedScene: SavedSceneFile,
+  pinned: boolean,
+) => {
+  const index = await readCanvasIndex();
+  const key = savedSceneKey(savedScene);
+  const existingEntry = index[key] ?? (await resolveCanvasIndexEntry(savedScene));
+
+  index[key] = {
+    ...existingEntry,
+    id: existingEntry.id || savedScene.canvasId || makeStableId(),
+    name: savedScene.name,
+    path: savedScene.path,
+    location: savedScene.location,
+    pinned,
+    updatedAt: new Date().toISOString(),
+  };
+
+  await writeCanvasIndex(index);
+  return pinned;
 };
 
 const normalizeSceneFilename = (filename: string) =>
@@ -1525,6 +1613,109 @@ export const saveImportedLibraryFile = async (filename: string, text: string) =>
   };
 };
 
+const customTemplatePath = (id: string) =>
+  `${APP_PATHS.customTemplateDir}/${id}.excalidraw`;
+
+export const listCustomTemplates = async (): Promise<CustomCanvasTemplate[]> => {
+  const index = await readCustomTemplateIndex();
+  const templates: CustomCanvasTemplate[] = [];
+  let changed = false;
+
+  for (const entry of index) {
+    const serializedScene = await readDataText(entry.path);
+    if (!serializedScene) {
+      changed = true;
+      continue;
+    }
+
+    try {
+      templates.push({
+        id: entry.id,
+        name: entry.name,
+        description: entry.description,
+        source: "custom",
+        createdAt: entry.createdAt,
+        updatedAt: entry.updatedAt,
+        initialData: await loadSceneFromText(serializedScene, []),
+      });
+    } catch {
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    await writeCustomTemplateIndex(
+      index.filter((entry) =>
+        templates.some((template) => template.id === entry.id),
+      ),
+    );
+  }
+
+  return templates.sort(
+    (first, second) =>
+      new Date(second.updatedAt).getTime() - new Date(first.updatedAt).getTime(),
+  );
+};
+
+export const saveCustomTemplate = async (options: {
+  name: string;
+  description: string;
+  serializedScene: string;
+}) => {
+  const index = await readCustomTemplateIndex();
+  const id = makeStableId();
+  const now = new Date().toISOString();
+  const name = sanitizeVisibleFilenamePart(options.name);
+  const entry: CustomTemplateIndexEntry = {
+    id,
+    name,
+    description: options.description.trim() || "Custom canvas template",
+    path: customTemplatePath(id),
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  await writeDataText(entry.path, options.serializedScene);
+  await writeCustomTemplateIndex([entry, ...index]);
+
+  return {
+    id,
+    name: entry.name,
+    description: entry.description,
+    source: "custom" as const,
+    createdAt: entry.createdAt,
+    updatedAt: entry.updatedAt,
+    initialData: await loadSceneFromText(options.serializedScene, []),
+  };
+};
+
+export const renameCustomTemplate = async (
+  template: CustomCanvasTemplate,
+  nextName: string,
+) => {
+  const index = await readCustomTemplateIndex();
+  const now = new Date().toISOString();
+  const nextIndex = index.map((entry) =>
+    entry.id === template.id
+      ? {
+          ...entry,
+          name: sanitizeVisibleFilenamePart(nextName),
+          updatedAt: now,
+        }
+      : entry,
+  );
+  await writeCustomTemplateIndex(nextIndex);
+};
+
+export const deleteCustomTemplate = async (template: CustomCanvasTemplate) => {
+  const index = await readCustomTemplateIndex();
+  const entry = index.find((item) => item.id === template.id);
+  await removeDataFile(entry?.path ?? customTemplatePath(template.id));
+  await writeCustomTemplateIndex(
+    index.filter((item) => item.id !== template.id),
+  );
+};
+
 const formatBackupTimestamp = (date: Date) => {
   const pad = (value: number) => String(value).padStart(2, "0");
   return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(
@@ -1556,6 +1747,48 @@ const readBackupSourceFiles = async (
   );
 };
 
+const readBackupAppDataFiles = async () => {
+  const entries: Array<{
+    path: string;
+    entryName: string;
+    size: number;
+    data: Uint8Array;
+  }> = [];
+  const appDataPaths: string[] = [
+    APP_PATHS.canvasIndex,
+    APP_PATHS.customTemplateIndex,
+  ];
+  const customTemplateIndex = await readCustomTemplateIndex();
+
+  for (const template of customTemplateIndex) {
+    appDataPaths.push(template.path);
+  }
+
+  for (const path of appDataPaths) {
+    try {
+      const text = await readDataText(path);
+      if (!text) {
+        continue;
+      }
+      const data = new TextEncoder().encode(text);
+      entries.push({
+        path,
+        entryName: `app-data/${path}`,
+        size: data.length,
+        data,
+      });
+    } catch {
+      // App-private metadata is best-effort in backups.
+    }
+  }
+
+  return entries;
+};
+
+const writeAppDataBackupEntry = async (path: string, data: Uint8Array) => {
+  await writeDataText(path, new TextDecoder().decode(data));
+};
+
 export const createBackupZip = async (): Promise<SavedExport> => {
   const filename = `escalidraw-backup-${formatBackupTimestamp(new Date())}.zip`;
 
@@ -1585,6 +1818,7 @@ export const createBackupZip = async (): Promise<SavedExport> => {
       readBackupSourceFiles("canvases"),
       readBackupSourceFiles("libraries"),
       readBackupSourceFiles("exports"),
+      readBackupAppDataFiles(),
     ])
   ).flat();
   const manifest = {
@@ -1634,6 +1868,7 @@ const isSafeBackupEntryPath = (path: string) => {
 
   return (
     path === "manifest.json" ||
+    path.startsWith("app-data/") ||
     path.startsWith("canvases/") ||
     path.startsWith("libraries/") ||
     path.startsWith("exports/")
@@ -1685,6 +1920,16 @@ export const restoreBackupZip = async (
       continue;
     }
 
+    if (entry.name.startsWith("app-data/")) {
+      await writeAppDataBackupEntry(
+        entry.name.slice("app-data/".length),
+        entry.data,
+      );
+      summary.restored += 1;
+      summary.files.push(entry.name);
+      continue;
+    }
+
     const pathParts = entry.name.split("/");
     const filename = pathParts[pathParts.length - 1];
     const directoryPath = `${USER_STORAGE_PATHS.root}/${pathParts
@@ -1719,7 +1964,7 @@ export const restoreBackupZip = async (
 export const loadAppBootstrap = async (
   pendingOpen: PendingOpenPayload | null,
 ): Promise<BootstrapState> => {
-  await ensureUserStorageDirectories();
+  await ensureUserStorageDirectories({ migrateLegacy: true });
 
   let libraryItems: LibraryItems = [];
 
@@ -1738,10 +1983,11 @@ export const loadAppBootstrap = async (
     readRecentScenes(),
     readSettings(),
   ]);
+  const customTemplates = await listCustomTemplates();
 
   if (pendingOpen) {
     try {
-      if (pendingOpen.name.endsWith(".excalidrawlib")) {
+      if (pendingOpen.name.toLowerCase().endsWith(".excalidrawlib")) {
         libraryItems = (await loadLibraryFromBlob(
           sceneBlobFromPendingOpen(pendingOpen),
         )) as LibraryItems;
@@ -1753,6 +1999,7 @@ export const loadAppBootstrap = async (
           },
           pageSettings: DEFAULT_PAGE_SETTINGS,
           libraryItems,
+          customTemplates,
           recents,
           settings,
           importNotice: `Imported library from ${pendingOpen.name}`,
@@ -1764,6 +2011,7 @@ export const loadAppBootstrap = async (
         initialData: sceneData,
         pageSettings: sceneData.pageSettings ?? DEFAULT_PAGE_SETTINGS,
         libraryItems,
+        customTemplates,
         recents,
         settings,
         importNotice: `Opened ${pendingOpen.name}`,
@@ -1776,6 +2024,7 @@ export const loadAppBootstrap = async (
         },
         pageSettings: DEFAULT_PAGE_SETTINGS,
         libraryItems,
+        customTemplates,
         recents,
         settings,
         importNotice: `Could not load ${pendingOpen.name}`,
@@ -1792,6 +2041,7 @@ export const loadAppBootstrap = async (
       },
       pageSettings: DEFAULT_PAGE_SETTINGS,
       libraryItems,
+      customTemplates,
       recents,
       settings,
     };
@@ -1803,6 +2053,7 @@ export const loadAppBootstrap = async (
       initialData: sceneData,
       pageSettings: sceneData.pageSettings ?? DEFAULT_PAGE_SETTINGS,
       libraryItems,
+      customTemplates,
       recents,
       settings,
     };
@@ -1814,6 +2065,7 @@ export const loadAppBootstrap = async (
       },
       pageSettings: DEFAULT_PAGE_SETTINGS,
       libraryItems,
+      customTemplates,
       recents,
       settings,
       importNotice: "Autosave recovery was unavailable, starting fresh.",

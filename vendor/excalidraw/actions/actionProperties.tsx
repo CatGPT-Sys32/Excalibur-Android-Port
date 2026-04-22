@@ -107,6 +107,8 @@ import {
   StrokeWidthBaseIcon,
   StrokeWidthBoldIcon,
   StrokeWidthExtraBoldIcon,
+  StrokeWidthFineIcon,
+  StrokeWidthHairlineIcon,
   FontSizeSmallIcon,
   FontSizeMediumIcon,
   FontSizeLargeIcon,
@@ -585,6 +587,18 @@ export const actionChangeStrokeWidth = register<
         <RadioSelection
           group="stroke-width"
           options={[
+            {
+              value: STROKE_WIDTH.hairline,
+              text: t("labels.hairline"),
+              icon: StrokeWidthHairlineIcon,
+              testId: "strokeWidth-hairline",
+            },
+            {
+              value: STROKE_WIDTH.fine,
+              text: t("labels.fine"),
+              icon: StrokeWidthFineIcon,
+              testId: "strokeWidth-fine",
+            },
             {
               value: STROKE_WIDTH.thin,
               text: t("labels.thin"),

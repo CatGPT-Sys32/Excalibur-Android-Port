@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 
 import {
   A4_PAGE_SIZE,
+  isA4MarginLocked,
   isPageTemplateEnabled,
   type PageSettings,
   type PageViewport,
@@ -412,9 +413,32 @@ function A4VerticalTemplate({
   viewport,
 }: PageTemplateOverlayProps & { viewport: PageViewport }) {
   const tiles = buildA4VerticalTiles(viewport);
+  const zoom = Math.max(0.01, viewport.zoom || 1);
+  const pageLeft = screenPoint(0, viewport.scrollX, zoom);
+  const pageRight = pageLeft + A4_PAGE_SIZE.width * zoom;
+  const marginLocked = isA4MarginLocked(pageSettings);
 
   return (
     <>
+      {marginLocked ? (
+        <>
+          <rect
+            className="draw-page-overlay-margin"
+            x={0}
+            y={0}
+            width={Math.max(0, pageLeft)}
+            height={viewport.height}
+          />
+          <rect
+            className="draw-page-overlay-margin"
+            x={Math.max(0, pageRight)}
+            y={0}
+            width={Math.max(0, viewport.width - Math.max(0, pageRight))}
+            height={viewport.height}
+          />
+        </>
+      ) : null}
+
       <defs>
         {tiles.map((tile) => (
           <clipPath key={tile.key} id={`draw-page-clip-${tile.row}-${tile.column}`}>

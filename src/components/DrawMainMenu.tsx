@@ -14,8 +14,10 @@ type DrawMainMenuProps = {
   openFiles: () => void;
   openDirectory: () => void;
   openTemplates: () => void;
+  openExportCenter: () => void;
   openPageSettings: () => void;
   openBackupCenter: () => void;
+  saveCurrentAsTemplate: () => Promise<void>;
   saveSceneCopy: () => Promise<void>;
   shareSceneCopy: () => Promise<void>;
   exportLibrary: () => Promise<void>;
@@ -33,6 +35,8 @@ type DrawMainMenuProps = {
   gridModeEnabled: boolean;
   objectsSnapModeEnabled: boolean;
   lastAutosavedAt: string | null;
+  autosaveStatus: string;
+  autosaveMessage?: string;
   recentsCount: number;
   nativeStylus: NativeStylusSnapshot | null;
   toggleTheme: () => void;
@@ -91,6 +95,15 @@ export function DrawMainMenu(props: DrawMainMenuProps) {
         </button>
       </MainMenu.ItemCustom>
       <MainMenu.ItemCustom>
+        <button
+          className={menuButtonClassName}
+          type="button"
+          onClick={props.saveCurrentAsTemplate}
+        >
+          <span className="draw-menu-button-label">Save current as template</span>
+        </button>
+      </MainMenu.ItemCustom>
+      <MainMenu.ItemCustom>
         <div className="draw-menu-section-title">Page Settings</div>
       </MainMenu.ItemCustom>
       <MainMenu.ItemCustom>
@@ -109,6 +122,11 @@ export function DrawMainMenu(props: DrawMainMenuProps) {
       <MainMenu.ItemCustom>
         <button className={menuButtonClassName} type="button" onClick={props.exportPdf}>
           <span className="draw-menu-button-label">Export A4 PDF to device</span>
+        </button>
+      </MainMenu.ItemCustom>
+      <MainMenu.ItemCustom>
+        <button className={menuButtonClassName} type="button" onClick={props.openExportCenter}>
+          <span className="draw-menu-button-label">Export Center</span>
         </button>
       </MainMenu.ItemCustom>
       <MainMenu.ItemCustom>
@@ -225,6 +243,10 @@ export function DrawMainMenu(props: DrawMainMenuProps) {
 
       <MainMenu.ItemCustom>
         <div className="draw-menu-status-card">
+          <div>
+            <span>Autosave</span>
+            <strong title={props.autosaveMessage}>{props.autosaveStatus}</strong>
+          </div>
           <div>
             <span>Last autosave</span>
             <strong>{formatTimestamp(props.lastAutosavedAt)}</strong>

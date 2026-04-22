@@ -9,9 +9,12 @@ export type PageTemplateId =
 
 export type PageCanvasMode = "infinite" | "a4-vertical";
 
+export type PageMarginMode = "writable" | "locked";
+
 export type PageSettings = {
   template: PageTemplateId;
   mode: PageCanvasMode;
+  marginMode: PageMarginMode;
   orientation: "portrait";
   pageSize: "a4";
 };
@@ -36,6 +39,12 @@ export type PageCanvasModeOption = {
   description: string;
 };
 
+export type PageMarginModeOption = {
+  id: PageMarginMode;
+  name: string;
+  description: string;
+};
+
 export const PAGE_SETTINGS_METADATA_KEY = "escalidrawPageSettings";
 
 export const A4_PAGE_SIZE = {
@@ -51,6 +60,7 @@ export const A4_PAGE_SIZE_MM = {
 export const DEFAULT_PAGE_SETTINGS: PageSettings = {
   template: "off",
   mode: "infinite",
+  marginMode: "writable",
   orientation: "portrait",
   pageSize: "a4",
 };
@@ -65,6 +75,19 @@ export const PAGE_CANVAS_MODE_OPTIONS: readonly PageCanvasModeOption[] = [
     id: "a4-vertical",
     name: "A4 vertical",
     description: "Portrait pages stack in one vertical notes column.",
+  },
+] as const;
+
+export const PAGE_MARGIN_MODE_OPTIONS: readonly PageMarginModeOption[] = [
+  {
+    id: "locked",
+    name: "Locked margins",
+    description: "Grey side margins reject marks outside the A4 page.",
+  },
+  {
+    id: "writable",
+    name: "Writable margins",
+    description: "Side margins stay available as canvas scratch space.",
   },
 ] as const;
 
@@ -114,6 +137,10 @@ const PAGE_CANVAS_MODES = new Set<PageCanvasMode>(
   PAGE_CANVAS_MODE_OPTIONS.map((option) => option.id),
 );
 
+const PAGE_MARGIN_MODES = new Set<PageMarginMode>(
+  PAGE_MARGIN_MODE_OPTIONS.map((option) => option.id),
+);
+
 export const getPageTemplateOption = (id: PageTemplateId) =>
   PAGE_TEMPLATE_OPTIONS.find((option) => option.id === id) ??
   PAGE_TEMPLATE_OPTIONS[0];
@@ -122,8 +149,15 @@ export const getPageCanvasModeOption = (id: PageCanvasMode) =>
   PAGE_CANVAS_MODE_OPTIONS.find((option) => option.id === id) ??
   PAGE_CANVAS_MODE_OPTIONS[0];
 
+export const getPageMarginModeOption = (id: PageMarginMode) =>
+  PAGE_MARGIN_MODE_OPTIONS.find((option) => option.id === id) ??
+  PAGE_MARGIN_MODE_OPTIONS[1];
+
 export const isPageTemplateEnabled = (pageSettings: PageSettings) =>
   pageSettings.template !== "off";
+
+export const isA4MarginLocked = (pageSettings: PageSettings) =>
+  pageSettings.mode === "a4-vertical" && pageSettings.marginMode === "locked";
 
 export const normalizePageSettings = (value: unknown): PageSettings => {
   if (!value || typeof value !== "object") {
@@ -143,9 +177,16 @@ export const normalizePageSettings = (value: unknown): PageSettings => {
       ? "infinite"
       : "a4-vertical";
 
+  const requestedMarginMode = (value as Partial<PageSettings>).marginMode;
+  const marginMode =
+    requestedMarginMode && PAGE_MARGIN_MODES.has(requestedMarginMode)
+      ? requestedMarginMode
+      : DEFAULT_PAGE_SETTINGS.marginMode;
+
   return {
     template,
     mode,
+    marginMode,
     orientation: "portrait",
     pageSize: "a4",
   };

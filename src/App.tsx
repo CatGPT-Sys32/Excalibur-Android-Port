@@ -18,13 +18,19 @@ import {
 import { BackupCenterModal } from "./components/BackupCenterModal";
 import { CanvasManagerModal } from "./components/CanvasManagerModal";
 import { DrawMainMenu } from "./components/DrawMainMenu";
+import { ExportCenterModal } from "./components/ExportCenterModal";
+import { ImportAssistantModal } from "./components/ImportAssistantModal";
 import { PageSettingsModal } from "./components/PageSettingsModal";
 import { PageTemplateOverlay } from "./components/PageTemplateOverlay";
 import { TemplatePickerModal } from "./components/TemplatePickerModal";
 import { isNativePlatform } from "./lib/capacitor";
+import type { ExportFormat } from "./lib/exports";
+import type { ImportFile, ImportPlan } from "./lib/imports";
 import {
+  A4_PAGE_SIZE,
   DEFAULT_PAGE_SETTINGS,
   getPageTemplateOption,
+  isA4MarginLocked,
   isPageTemplateEnabled,
   normalizePageSettings,
   type PageSettings,
@@ -40,16 +46,19 @@ import {
   getStylusSnapshotSafe,
   openStorageDirectorySafe,
   type NativeStylusSnapshot,
+  type PendingOpenFile,
   type PendingOpenPayload,
 } from "./lib/androidBridge";
 import {
   DEFAULT_SETTINGS,
+  deleteCustomTemplate,
   createBackupZip,
   deleteSavedScene,
   duplicateSavedScene,
   getSavedSceneThumbnail,
   listSavedScenesFromDevice,
   listCanvasVersions,
+  listCustomTemplates,
   loadAppBootstrap,
   loadSceneFromBlobData,
   loadSceneFromPath,
@@ -59,13 +68,16 @@ import {
   persistSavedSceneThumbnail,
   persistSettings,
   renameSavedScene,
+  renameCustomTemplate,
   restoreBackupZip,
   restoreCanvasVersion,
   saveCanvasVersion,
   saveBlobExport,
+  saveCustomTemplate,
   saveImportedLibraryFile,
   saveImportedSceneFile,
   saveRecoverySnapshot,
+  setSavedScenePinned,
   saveTextExport,
   sceneHasContent,
   serializeLibrary,
@@ -73,13 +85,18 @@ import {
   suggestedFilename,
   writeAutosave,
   type CanvasVersionMeta,
+  type CustomCanvasTemplate,
   type DrawSettings,
   type SavedSceneFile,
   type SavedExport,
   type ScenePayload,
   type SceneSnapshotMeta,
 } from "./lib/persistence";
-import { newImageElement, syncInvalidIndices } from "@excalidraw/element";
+import {
+  getCommonBounds,
+  newImageElement,
+  syncInvalidIndices,
+} from "@excalidraw/element";
 import type {
   AppState,
   BinaryFileData,
@@ -99,9 +116,12 @@ import type {
 const AUTOSAVE_DEBOUNCE_MS = 700;
 const SNAPSHOT_INTERVAL_MS = 3 * 60 * 1000;
 const MAX_PENDING_OPEN_BYTES = 8 * 1024 * 1024;
+const AUTOSAVE_WARNING_INTERVAL_MS = 30 * 1000;
 const STRAIGHTEN_HOLD_MS = 240;
 const STRAIGHTEN_MOVE_THRESHOLD = 5;
 const STRAIGHTEN_MIN_SEGMENT = 12;
+const A4_MARGIN_GUARD_EPSILON = 0.5;
+const A4_MARGIN_TOAST_INTERVAL_MS = 1800;
 
 type ScenePoint = {
   x: number;
@@ -136,11 +156,236 @@ type ExportScenePayload = {
   files: BinaryFiles;
 };
 
-type ImportFile = {
-  name: string;
-  mimeType: string;
-  blob: Blob;
-  size: number;
+type AutosaveStatus = "idle" | "saving" | "saved" | "degraded" | "failed";
+
+type AutosaveHealth = {
+  status: AutosaveStatus;
+  updatedAt: string | null;
+  message?: string;
+};
+
+type FreeDrawSample = {
+  x: number;
+  y: number;
+  pressure: number;
+};
+
+type FreeDrawLocalPoint = ExcalidrawFreeDrawElement["points"][number];
+
+const A4_PAGE_LEFT = 0;
+const A4_PAGE_RIGHT = A4_PAGE_SIZE.width;
+const SEGMENT_CLIP_EPSILON = 0.0001;
+
+const clampA4PageX = (x: number) =>
+  Math.min(A4_PAGE_RIGHT, Math.max(A4_PAGE_LEFT, x));
+
+const getFreeDrawPressure = (
+  element: ExcalidrawFreeDrawElement,
+  index: number,
+) =>
+  element.pressures[index] ??
+  element.pressures[index - 1] ??
+  element.pressures[index + 1] ??
+  0.5;
+
+const sampleFreeDrawAt = (
+  start: FreeDrawSample,
+  end: FreeDrawSample,
+  t: number,
+): FreeDrawSample => ({
+  x: clampA4PageX(start.x + (end.x - start.x) * t),
+  y: start.y + (end.y - start.y) * t,
+  pressure: start.pressure + (end.pressure - start.pressure) * t,
+});
+
+const clipSegmentToA4PageWidth = (
+  start: FreeDrawSample,
+  end: FreeDrawSample,
+) => {
+  const deltaX = end.x - start.x;
+  let startT = 0;
+  let endT = 1;
+
+  if (Math.abs(deltaX) < SEGMENT_CLIP_EPSILON) {
+    if (start.x < A4_PAGE_LEFT || start.x > A4_PAGE_RIGHT) {
+      return null;
+    }
+  } else {
+    const leftT = (A4_PAGE_LEFT - start.x) / deltaX;
+    const rightT = (A4_PAGE_RIGHT - start.x) / deltaX;
+    startT = Math.max(startT, Math.min(leftT, rightT));
+    endT = Math.min(endT, Math.max(leftT, rightT));
+
+    if (startT - endT > SEGMENT_CLIP_EPSILON) {
+      return null;
+    }
+  }
+
+  return [sampleFreeDrawAt(start, end, startT), sampleFreeDrawAt(start, end, endT)];
+};
+
+const appendFreeDrawSample = (
+  samples: FreeDrawSample[],
+  nextSample: FreeDrawSample,
+) => {
+  const previousSample = samples[samples.length - 1];
+  if (
+    previousSample &&
+    Math.abs(previousSample.x - nextSample.x) < SEGMENT_CLIP_EPSILON &&
+    Math.abs(previousSample.y - nextSample.y) < SEGMENT_CLIP_EPSILON
+  ) {
+    return;
+  }
+
+  samples.push(nextSample);
+};
+
+const isFreeDrawInsideA4PageWidth = (
+  element: ExcalidrawFreeDrawElement,
+) =>
+  element.points.every((point) => {
+    const x = element.x + point[0];
+    return (
+      x >= A4_PAGE_LEFT - A4_MARGIN_GUARD_EPSILON &&
+      x <= A4_PAGE_RIGHT + A4_MARGIN_GUARD_EPSILON
+    );
+  });
+
+const clipFreeDrawToA4PageWidth = (
+  element: ExcalidrawFreeDrawElement,
+): ExcalidrawFreeDrawElement | null => {
+  if (element.angle !== 0 || element.points.length === 0) {
+    return null;
+  }
+
+  const samples = element.points.map((point, index) => ({
+    x: element.x + point[0],
+    y: element.y + point[1],
+    pressure: getFreeDrawPressure(element, index),
+  }));
+  const clippedSamples: FreeDrawSample[] = [];
+
+  if (samples.length === 1) {
+    if (!isFreeDrawInsideA4PageWidth(element)) {
+      return null;
+    }
+    clippedSamples.push({
+      ...samples[0],
+      x: clampA4PageX(samples[0].x),
+    });
+  }
+
+  for (let index = 1; index < samples.length; index += 1) {
+    const clippedSegment = clipSegmentToA4PageWidth(
+      samples[index - 1],
+      samples[index],
+    );
+
+    if (!clippedSegment) {
+      continue;
+    }
+
+    appendFreeDrawSample(clippedSamples, clippedSegment[0]);
+    appendFreeDrawSample(clippedSamples, clippedSegment[1]);
+  }
+
+  if (clippedSamples.length === 0) {
+    return null;
+  }
+
+  const minX = Math.min(...clippedSamples.map((sample) => sample.x));
+  const minY = Math.min(...clippedSamples.map((sample) => sample.y));
+  const maxX = Math.max(...clippedSamples.map((sample) => sample.x));
+  const maxY = Math.max(...clippedSamples.map((sample) => sample.y));
+  const points = clippedSamples.map(
+    (sample) => [sample.x - minX, sample.y - minY] as FreeDrawLocalPoint,
+  );
+
+  return {
+    ...element,
+    x: minX,
+    y: minY,
+    width: maxX - minX,
+    height: maxY - minY,
+    points,
+    pressures: element.simulatePressure
+      ? []
+      : clippedSamples.map((sample) => sample.pressure),
+    updated: Date.now(),
+    version: element.version + 1,
+    versionNonce: Math.trunc(Math.random() * 2147483647),
+  };
+};
+
+const isElementInsideA4PageWidth = (element: OrderedExcalidrawElement) => {
+  if (element.isDeleted) {
+    return true;
+  }
+
+  if (element.type === "freedraw") {
+    return isFreeDrawInsideA4PageWidth(element as ExcalidrawFreeDrawElement);
+  }
+
+  const [minX, , maxX] = getCommonBounds([element as never]);
+  return (
+    minX >= -A4_MARGIN_GUARD_EPSILON &&
+    maxX <= A4_PAGE_SIZE.width + A4_MARGIN_GUARD_EPSILON
+  );
+};
+
+const buildAcceptedA4ElementMap = (
+  elements: readonly OrderedExcalidrawElement[],
+) => {
+  const acceptedElements = new Map<string, OrderedExcalidrawElement>();
+
+  for (const element of elements) {
+    if (isElementInsideA4PageWidth(element)) {
+      acceptedElements.set(element.id, element);
+    }
+  }
+
+  return acceptedElements;
+};
+
+const getA4MarginGuardedElements = (
+  elements: readonly OrderedExcalidrawElement[],
+  acceptedElements: ReadonlyMap<string, OrderedExcalidrawElement>,
+  options: { keepPendingFreeDraw: boolean },
+) => {
+  let changed = false;
+  const nextElements: OrderedExcalidrawElement[] = [];
+
+  for (const element of elements) {
+    if (isElementInsideA4PageWidth(element)) {
+      nextElements.push(element);
+      continue;
+    }
+
+    if (options.keepPendingFreeDraw && element.type === "freedraw") {
+      nextElements.push(element);
+      continue;
+    }
+
+    changed = true;
+    if (element.type === "freedraw") {
+      const clippedElement = clipFreeDrawToA4PageWidth(
+        element as ExcalidrawFreeDrawElement,
+      );
+
+      if (clippedElement) {
+        nextElements.push(clippedElement as OrderedExcalidrawElement);
+        continue;
+      }
+    }
+
+    const acceptedElement = acceptedElements.get(element.id);
+    if (acceptedElement && isElementInsideA4PageWidth(acceptedElement)) {
+      nextElements.push(acceptedElement);
+      continue;
+    }
+  }
+
+  return changed ? nextElements : null;
 };
 
 const distanceBetweenPoints = (first: ScenePoint, second: ScenePoint) =>
@@ -309,6 +554,74 @@ const isSceneImport = (file: Pick<ImportFile, "name" | "mimeType">) => {
   );
 };
 
+const createImportPlan = (importFiles: readonly ImportFile[]): ImportPlan =>
+  importFiles.reduce<ImportPlan>(
+    (plan, file) => {
+      if (file.size > MAX_PENDING_OPEN_BYTES) {
+        plan.oversized.push(file);
+        return plan;
+      }
+
+      if (isLibraryImport(file)) {
+        plan.libraries.push(file);
+      } else if (isImageImport(file)) {
+        plan.images.push(file);
+      } else if (isSceneImport(file)) {
+        plan.scenes.push(file);
+      } else {
+        plan.unsupported.push(file);
+      }
+
+      return plan;
+    },
+    {
+      scenes: [],
+      libraries: [],
+      images: [],
+      unsupported: [],
+      oversized: [],
+    },
+  );
+
+const supportedImportCount = (plan: ImportPlan) =>
+  plan.scenes.length + plan.libraries.length + plan.images.length;
+
+const estimatePendingOpenSize = (file: PendingOpenFile) => {
+  if (typeof file.size === "number") {
+    return file.size;
+  }
+
+  return file.encoding === "base64"
+    ? Math.floor((file.data.length * 3) / 4)
+    : new TextEncoder().encode(file.data).byteLength;
+};
+
+const pendingOpenFileToImportFile = (file: PendingOpenFile): ImportFile => {
+  const fallbackMimeType = isLibraryImport(file)
+    ? MIME_TYPES.excalidrawlib
+    : isImageImport(file)
+    ? file.mimeType || MIME_TYPES.binary
+    : MIME_TYPES.excalidraw;
+  const estimatedSize = estimatePendingOpenSize(file);
+
+  if (estimatedSize > MAX_PENDING_OPEN_BYTES) {
+    return {
+      name: file.name,
+      mimeType: file.mimeType || fallbackMimeType,
+      blob: new Blob([], { type: file.mimeType || fallbackMimeType }),
+      size: estimatedSize,
+    };
+  }
+
+  const blob = pendingOpenToBlob(file, fallbackMimeType);
+  return {
+    name: file.name,
+    mimeType: file.mimeType || fallbackMimeType,
+    blob,
+    size: file.size ?? blob.size,
+  };
+};
+
 const pendingOpenFiles = (pendingOpen: PendingOpenPayload) =>
   pendingOpen.files?.length ? pendingOpen.files : [pendingOpen];
 
@@ -331,6 +644,9 @@ const formatExportTimestamp = (date: Date) => {
   )}-${pad(date.getHours())}${pad(date.getMinutes())}`;
 };
 
+const formatAutosaveStatus = (status: AutosaveStatus) =>
+  status[0].toUpperCase() + status.slice(1);
+
 function App() {
   const [api, setApi] = useState<ExcalidrawImperativeAPI | null>(null);
   const [initialData, setInitialData] = useState<ExcalidrawInitialDataState | null>(
@@ -344,6 +660,10 @@ function App() {
   const [sceneName, setSceneName] = useState("Untitled scene");
   const [theme, setTheme] = useState<Theme>("light");
   const [lastAutosavedAt, setLastAutosavedAt] = useState<string | null>(null);
+  const [autosaveHealth, setAutosaveHealth] = useState<AutosaveHealth>({
+    status: "idle",
+    updatedAt: null,
+  });
   const [penMode, setPenMode] = useState(false);
   const [penDetected, setPenDetected] = useState(false);
   const [nativeStylus, setNativeStylus] = useState<NativeStylusSnapshot | null>(
@@ -360,9 +680,17 @@ function App() {
   const [canvasDirectoryLoading, setCanvasDirectoryLoading] = useState(false);
   const [savedCanvasFiles, setSavedCanvasFiles] = useState<SavedSceneFile[]>([]);
   const [templatePickerOpen, setTemplatePickerOpen] = useState(false);
+  const [customTemplates, setCustomTemplates] = useState<CustomCanvasTemplate[]>(
+    [],
+  );
   const [pageSettingsOpen, setPageSettingsOpen] = useState(false);
   const [backupCenterOpen, setBackupCenterOpen] = useState(false);
   const [backupBusy, setBackupBusy] = useState(false);
+  const [importAssistantPlan, setImportAssistantPlan] =
+    useState<ImportPlan | null>(null);
+  const [importAssistantBusy, setImportAssistantBusy] = useState(false);
+  const [exportCenterOpen, setExportCenterOpen] = useState(false);
+  const [exportCenterBusy, setExportCenterBusy] = useState(false);
   const [activeTimelineScene, setActiveTimelineScene] =
     useState<SavedSceneFile | null>(null);
   const [canvasVersions, setCanvasVersions] = useState<CanvasVersionMeta[]>([]);
@@ -381,7 +709,14 @@ function App() {
   const libraryItemsRef = useRef<LibraryItems>([]);
   const autosaveTimerRef = useRef<number | null>(null);
   const toastTimerRef = useRef<number | null>(null);
+  const lastAutosaveWarningAtRef = useRef(0);
+  const a4MarginGuardTimerRef = useRef<number | null>(null);
   const hasMeaningfulChangeRef = useRef(false);
+  const acceptedA4ElementsRef = useRef<Map<string, OrderedExcalidrawElement>>(
+    new Map(),
+  );
+  const suppressA4MarginGuardRef = useRef(false);
+  const lastA4MarginToastAtRef = useRef(0);
   const straightenSessionRef = useRef<StraightenSession>({
     ...EMPTY_STRAIGHTEN_SESSION,
   });
@@ -430,6 +765,29 @@ function App() {
       toastTimerRef.current = null;
     }, 10000);
   }, []);
+
+  const showThrottledAutosaveWarning = useCallback(
+    (message: string) => {
+      const now = Date.now();
+      if (now - lastAutosaveWarningAtRef.current < AUTOSAVE_WARNING_INTERVAL_MS) {
+        return;
+      }
+
+      lastAutosaveWarningAtRef.current = now;
+      showToast(message);
+    },
+    [showToast],
+  );
+
+  const showA4MarginLockedToast = useCallback(() => {
+    const now = Date.now();
+    if (now - lastA4MarginToastAtRef.current < A4_MARGIN_TOAST_INTERVAL_MS) {
+      return;
+    }
+
+    lastA4MarginToastAtRef.current = now;
+    showToast("A4 margins are locked");
+  }, [showToast]);
 
   const resetStraightenSession = useCallback(() => {
     const currentSession = straightenSessionRef.current;
@@ -524,11 +882,20 @@ function App() {
         return false;
       }
 
+      setAutosaveHealth({
+        status: "saving",
+        updatedAt: new Date().toISOString(),
+      });
       let serialized = serializeScene(payload, pageSettingsRef.current);
 
       try {
         await writeAutosave(serialized);
-        setLastAutosavedAt(new Date().toISOString());
+        const savedAt = new Date().toISOString();
+        setLastAutosavedAt(savedAt);
+        setAutosaveHealth({
+          status: "saved",
+          updatedAt: savedAt,
+        });
       } catch {
         try {
           // Compact fallback keeps autosave available when file payloads are too large.
@@ -540,8 +907,24 @@ function App() {
             pageSettingsRef.current,
           );
           await writeAutosave(serialized);
-          setLastAutosavedAt(new Date().toISOString());
+          const savedAt = new Date().toISOString();
+          const message =
+            "Autosave is degraded. Embedded files/images may need manual save/export.";
+          setLastAutosavedAt(savedAt);
+          setAutosaveHealth({
+            status: "degraded",
+            updatedAt: savedAt,
+            message,
+          });
+          showThrottledAutosaveWarning(message);
         } catch {
+          const message = "Autosave failed. Use Save to device or Export Center.";
+          setAutosaveHealth({
+            status: "failed",
+            updatedAt: new Date().toISOString(),
+            message,
+          });
+          showThrottledAutosaveWarning(message);
           return false;
         }
       }
@@ -578,7 +961,7 @@ function App() {
 
       return true;
     },
-    [showToast],
+    [showThrottledAutosaveWarning, showToast],
   );
 
   const scheduleAutosave = useCallback(() => {
@@ -608,8 +991,12 @@ function App() {
         (sceneData as ExcalidrawInitialDataState & { pageSettings?: PageSettings })
           .pageSettings,
       );
+      const nextElements =
+        (sceneData.elements as readonly OrderedExcalidrawElement[] | undefined) ??
+        [];
       setPageSettings(nextPageSettings);
       pageSettingsRef.current = nextPageSettings;
+      acceptedA4ElementsRef.current = buildAcceptedA4ElementMap(nextElements);
       currentApi.history.clear();
 
       if (sceneData.libraryItems) {
@@ -628,9 +1015,7 @@ function App() {
       }
 
       currentApi.updateScene({
-        elements:
-          (sceneData.elements as readonly OrderedExcalidrawElement[] | undefined) ??
-          [],
+        elements: nextElements,
         appState: {
           ...currentApi.getAppState(),
           ...(sceneData.appState ?? {}),
@@ -735,22 +1120,23 @@ function App() {
     [persistCurrentScene],
   );
 
-  const processImportFiles = useCallback(
-    async (importFiles: readonly ImportFile[]) => {
+  const executeImportPlan = useCallback(
+    async (plan: ImportPlan) => {
       const currentApi = apiRef.current;
-      if (!currentApi || importFiles.length === 0) {
+      if (!currentApi || supportedImportCount(plan) === 0) {
+        showToast("No supported files found");
         return;
       }
 
       await stageCurrentSceneForImport();
 
-      const sceneFiles = importFiles.filter(isSceneImport);
-      const libraryFiles = importFiles.filter(isLibraryImport);
-      const imageFiles = importFiles.filter(isImageImport);
-
-      if (importFiles.length === 1 && sceneFiles.length === 1) {
+      if (
+        plan.scenes.length === 1 &&
+        plan.libraries.length === 0 &&
+        plan.images.length === 0
+      ) {
         const scene = await loadSceneFromBlobData(
-          sceneFiles[0].blob,
+          plan.scenes[0].blob,
           libraryItemsRef.current,
         );
 
@@ -760,7 +1146,7 @@ function App() {
             ...scene,
             libraryItems: libraryItemsRef.current,
           },
-          `Opened ${sceneFiles[0].name}`,
+          `Opened ${plan.scenes[0].name}`,
         );
         return;
       }
@@ -769,12 +1155,12 @@ function App() {
       let mergedLibraries = 0;
       let insertedImages = 0;
 
-      for (const sceneFile of sceneFiles) {
+      for (const sceneFile of plan.scenes) {
         await saveImportedSceneFile(sceneFile.name, await sceneFile.blob.text());
         copiedScenes += 1;
       }
 
-      for (const libraryFile of libraryFiles) {
+      for (const libraryFile of plan.libraries) {
         const nextLibraryItems = (await currentApi.updateLibrary({
           libraryItems: libraryFile.blob,
           merge: true,
@@ -788,7 +1174,7 @@ function App() {
         mergedLibraries += 1;
       }
 
-      insertedImages = await insertImageFiles(imageFiles);
+      insertedImages = await insertImageFiles(plan.images);
 
       const summary = [
         copiedScenes ? `${copiedScenes} canvas file${copiedScenes === 1 ? "" : "s"}` : "",
@@ -797,9 +1183,14 @@ function App() {
           : "",
         insertedImages ? `${insertedImages} image${insertedImages === 1 ? "" : "s"}` : "",
       ].filter(Boolean);
+      const skipped = plan.unsupported.length + plan.oversized.length;
 
       if (summary.length) {
-        showToast(`Imported ${summary.join(", ")}`);
+        showToast(
+          `Imported ${summary.join(", ")}${
+            skipped ? `; skipped ${skipped}` : ""
+          }`,
+        );
         await refreshSavedScenesRef.current?.();
       } else {
         showToast("No supported files found");
@@ -813,6 +1204,31 @@ function App() {
     ],
   );
 
+  const processImportFiles = useCallback(
+    async (importFiles: readonly ImportFile[]) => {
+      if (!apiRef.current || importFiles.length === 0) {
+        return;
+      }
+
+      const plan = createImportPlan(importFiles);
+      const isSingleDirectScene =
+        importFiles.length === 1 &&
+        plan.scenes.length === 1 &&
+        plan.libraries.length === 0 &&
+        plan.images.length === 0 &&
+        plan.unsupported.length === 0 &&
+        plan.oversized.length === 0;
+
+      if (isSingleDirectScene) {
+        await executeImportPlan(plan);
+        return;
+      }
+
+      setImportAssistantPlan(plan);
+    },
+    [executeImportPlan],
+  );
+
   const handlePendingOpen = useCallback(
     async (pendingOpen: PendingOpenPayload) => {
       const currentApi = apiRef.current;
@@ -821,22 +1237,9 @@ function App() {
       }
 
       try {
-        const importFiles = pendingOpenFiles(pendingOpen).map((file) => {
-          const fallbackMimeType = isLibraryImport(file)
-            ? MIME_TYPES.excalidrawlib
-            : isImageImport(file)
-            ? file.mimeType || MIME_TYPES.binary
-            : MIME_TYPES.excalidraw;
-
-          const blob = pendingOpenToBlob(file, fallbackMimeType);
-          return {
-            name: file.name,
-            mimeType: file.mimeType || fallbackMimeType,
-            blob,
-            size: file.size ?? blob.size,
-          };
-        });
-
+        const importFiles = pendingOpenFiles(pendingOpen).map(
+          pendingOpenFileToImportFile,
+        );
         await processImportFiles(importFiles);
       } catch {
         showToast(`Could not open ${pendingOpen.name}`);
@@ -1034,6 +1437,45 @@ function App() {
     setPageViewport(nextViewport);
   }, []);
 
+  const applyA4MarginGuard = useCallback(
+    (
+      elements: readonly OrderedExcalidrawElement[],
+      payload?: { appState: AppState; files: BinaryFiles },
+      options: { keepPendingFreeDraw?: boolean } = {},
+    ) => {
+      const guardedElements = getA4MarginGuardedElements(
+        elements,
+        acceptedA4ElementsRef.current,
+        { keepPendingFreeDraw: options.keepPendingFreeDraw ?? false },
+      );
+
+      if (!guardedElements) {
+        acceptedA4ElementsRef.current = buildAcceptedA4ElementMap(elements);
+        return false;
+      }
+
+      acceptedA4ElementsRef.current =
+        buildAcceptedA4ElementMap(guardedElements);
+      suppressA4MarginGuardRef.current = true;
+
+      if (payload) {
+        latestSceneRef.current = {
+          elements: guardedElements,
+          appState: payload.appState,
+          files: payload.files,
+        };
+      }
+
+      apiRef.current?.updateScene({
+        elements: guardedElements,
+        captureUpdate: CaptureUpdateAction.NEVER,
+      });
+      showA4MarginLockedToast();
+      return true;
+    },
+    [showA4MarginLockedToast],
+  );
+
   const handlePointerUpdate = useCallback(
     (payload: {
       pointer: { x: number; y: number; tool: "pointer" | "laser" };
@@ -1067,12 +1509,6 @@ function App() {
       appState: AppState,
       files: BinaryFiles,
     ) => {
-      latestSceneRef.current = {
-        elements,
-        appState,
-        files,
-      };
-
       setSceneName(makeSceneTitle(appState.name));
       setTheme(appState.theme);
       setPenMode(appState.penMode);
@@ -1082,6 +1518,28 @@ function App() {
       setGridModeEnabled(appState.gridModeEnabled);
       setObjectsSnapModeEnabled(appState.objectsSnapModeEnabled);
       syncPageViewportFromAppState(appState);
+
+      if (suppressA4MarginGuardRef.current) {
+        suppressA4MarginGuardRef.current = false;
+        acceptedA4ElementsRef.current = buildAcceptedA4ElementMap(elements);
+      } else if (isA4MarginLocked(pageSettingsRef.current)) {
+        const guarded = applyA4MarginGuard(
+          elements,
+          { appState, files },
+          { keepPendingFreeDraw: true },
+        );
+        if (guarded) {
+          return;
+        }
+      } else {
+        acceptedA4ElementsRef.current = buildAcceptedA4ElementMap(elements);
+      }
+
+      latestSceneRef.current = {
+        elements,
+        appState,
+        files,
+      };
 
       if (suppressStraightenPassRef.current) {
         suppressStraightenPassRef.current = false;
@@ -1167,40 +1625,73 @@ function App() {
 
       scheduleAutosave();
     },
-    [scheduleAutosave, syncPageViewportFromAppState],
+    [applyA4MarginGuard, scheduleAutosave, syncPageViewportFromAppState],
   );
 
   useEffect(() => {
     let cancelled = false;
 
     const bootstrap = async () => {
-      const pendingOpen = await getPendingOpenSafe();
-      const deferPendingOpen = shouldDeferPendingOpen(pendingOpen);
-      if (deferPendingOpen) {
-        deferredPendingOpenRef.current = pendingOpen;
+      try {
+        const pendingOpen = await getPendingOpenSafe();
+        const deferPendingOpen = shouldDeferPendingOpen(pendingOpen);
+        if (deferPendingOpen) {
+          deferredPendingOpenRef.current = pendingOpen;
+        }
+
+        const nextBootstrap = await loadAppBootstrap(
+          deferPendingOpen ? null : pendingOpen,
+        );
+        await clearPendingOpenSafe();
+
+        if (cancelled) {
+          return;
+        }
+
+        setInitialData(nextBootstrap.initialData);
+        setLibraryItems(nextBootstrap.libraryItems);
+        setCustomTemplates(nextBootstrap.customTemplates);
+        setRecents(nextBootstrap.recents);
+        setSettings(nextBootstrap.settings);
+        setPageSettings(nextBootstrap.pageSettings);
+        setBootstrapNotice(nextBootstrap.importNotice ?? null);
+        libraryItemsRef.current = nextBootstrap.libraryItems;
+        recentsRef.current = nextBootstrap.recents;
+        settingsRef.current = nextBootstrap.settings;
+        pageSettingsRef.current = nextBootstrap.pageSettings;
+        acceptedA4ElementsRef.current = buildAcceptedA4ElementMap(
+          (nextBootstrap.initialData?.elements as
+            | readonly OrderedExcalidrawElement[]
+            | undefined) ?? [],
+        );
+        setBootstrapped(true);
+      } catch {
+        if (cancelled) {
+          return;
+        }
+
+        const safeInitialData: ExcalidrawInitialDataState = {
+          appState: { showWelcomeScreen: true },
+          libraryItems: [],
+        };
+        setInitialData(safeInitialData);
+        setLibraryItems([]);
+        setCustomTemplates([]);
+        setRecents([]);
+        setSettings(DEFAULT_SETTINGS);
+        setPageSettings(DEFAULT_PAGE_SETTINGS);
+        setBootstrapNotice("Startup recovery used a blank canvas.");
+        libraryItemsRef.current = [];
+        recentsRef.current = [];
+        settingsRef.current = DEFAULT_SETTINGS;
+        pageSettingsRef.current = DEFAULT_PAGE_SETTINGS;
+        acceptedA4ElementsRef.current = new Map();
+        setBootstrapped(true);
+      } finally {
+        if (!cancelled) {
+          await SplashScreen.hide().catch(() => undefined);
+        }
       }
-
-      const nextBootstrap = await loadAppBootstrap(
-        deferPendingOpen ? null : pendingOpen,
-      );
-      await clearPendingOpenSafe();
-
-      if (cancelled) {
-        return;
-      }
-
-      setInitialData(nextBootstrap.initialData);
-      setLibraryItems(nextBootstrap.libraryItems);
-      setRecents(nextBootstrap.recents);
-      setSettings(nextBootstrap.settings);
-      setPageSettings(nextBootstrap.pageSettings);
-      setBootstrapNotice(nextBootstrap.importNotice ?? null);
-      libraryItemsRef.current = nextBootstrap.libraryItems;
-      recentsRef.current = nextBootstrap.recents;
-      settingsRef.current = nextBootstrap.settings;
-      pageSettingsRef.current = nextBootstrap.pageSettings;
-      setBootstrapped(true);
-      await SplashScreen.hide().catch(() => undefined);
     };
 
     void bootstrap();
@@ -1321,15 +1812,39 @@ function App() {
     );
 
     const unsubscribePointerUp = api.onPointerUp(() => {
+      if (a4MarginGuardTimerRef.current) {
+        window.clearTimeout(a4MarginGuardTimerRef.current);
+      }
+
+      if (isA4MarginLocked(pageSettingsRef.current)) {
+        a4MarginGuardTimerRef.current = window.setTimeout(() => {
+          a4MarginGuardTimerRef.current = null;
+          const currentApi = apiRef.current ?? api;
+          if (!currentApi || !isA4MarginLocked(pageSettingsRef.current)) {
+            return;
+          }
+
+          const payload = createScenePayload(currentApi);
+          applyA4MarginGuard(
+            payload.elements,
+            { appState: payload.appState, files: payload.files },
+            { keepPendingFreeDraw: false },
+          );
+        }, 0);
+      }
       resetStraightenSession();
     });
 
     return () => {
       unsubscribePointerDown();
       unsubscribePointerUp();
+      if (a4MarginGuardTimerRef.current) {
+        window.clearTimeout(a4MarginGuardTimerRef.current);
+        a4MarginGuardTimerRef.current = null;
+      }
       resetStraightenSession();
     };
-  }, [api, resetStraightenSession, scheduleStraightenCheck]);
+  }, [api, applyA4MarginGuard, resetStraightenSession, scheduleStraightenCheck]);
 
   useEffect(() => {
     const listenerPromise = AppPlugin.addListener("appStateChange", ({ isActive }) => {
@@ -1350,6 +1865,9 @@ function App() {
       }
       if (toastTimerRef.current) {
         window.clearTimeout(toastTimerRef.current);
+      }
+      if (a4MarginGuardTimerRef.current) {
+        window.clearTimeout(a4MarginGuardTimerRef.current);
       }
     };
   }, []);
@@ -1703,6 +2221,100 @@ function App() {
     }
   }, [showToast]);
 
+  const exportSelectedFormats = useCallback(
+    async (formats: readonly ExportFormat[]) => {
+      const currentApi = apiRef.current;
+      if (!currentApi || formats.length === 0) {
+        return;
+      }
+
+      setExportCenterBusy(true);
+      try {
+        const exportPayload = createExportPayload(currentApi);
+        const title = makeSceneTitle(exportPayload.appState.name);
+        const timestamp = formatExportTimestamp(new Date());
+        let exportedCount = 0;
+        let failedCount = 0;
+
+        for (const format of formats) {
+          try {
+            if (format === "excalidraw") {
+              await saveTextExport(
+                suggestedFilename(`${title}-${timestamp}`, ".excalidraw"),
+                serializeScene(createScenePayload(currentApi), pageSettingsRef.current),
+                MIME_TYPES.excalidraw,
+                { forceExports: true },
+              );
+              exportedCount += 1;
+              continue;
+            }
+
+            if (format === "png") {
+              const { exportToBlob } = await import("@excalidraw/excalidraw");
+              const blob = await exportToBlob({
+                elements: exportPayload.elements,
+                appState: exportPayload.appState,
+                files: exportPayload.files,
+                mimeType: MIME_TYPES.png,
+              });
+              await saveBlobExport(
+                suggestedFilename(`${title}-${timestamp}`, ".png"),
+                blob,
+              );
+              exportedCount += 1;
+              continue;
+            }
+
+            if (format === "svg") {
+              const { exportToSvg } = await import("@excalidraw/excalidraw");
+              const svgElement = await exportToSvg({
+                elements: exportPayload.elements,
+                appState: exportPayload.appState,
+                files: exportPayload.files,
+              });
+              await saveBlobExport(
+                suggestedFilename(`${title}-${timestamp}`, ".svg"),
+                new Blob([svgElement.outerHTML], { type: MIME_TYPES.svg }),
+              );
+              exportedCount += 1;
+              continue;
+            }
+
+            if (format === "pdf") {
+              const { createA4PdfBlob } = await import("./lib/pdfExport");
+              const blob = await createA4PdfBlob(
+                exportPayload,
+                pageSettingsRef.current,
+              );
+              await saveBlobExport(
+                suggestedFilename(`${title}-${timestamp}`, ".pdf"),
+                blob,
+              );
+              exportedCount += 1;
+            }
+          } catch {
+            failedCount += 1;
+          }
+        }
+
+        if (exportedCount === 0) {
+          showToast("Export Center failed");
+          return;
+        }
+
+        showToast(
+          `Exported ${exportedCount} file${exportedCount === 1 ? "" : "s"}${
+            failedCount ? `, ${failedCount} failed` : ""
+          }`,
+        );
+        setExportCenterOpen(false);
+      } finally {
+        setExportCenterBusy(false);
+      }
+    },
+    [showToast],
+  );
+
   const restoreLatestAutosave = useCallback(async () => {
     const latestRecent = recentsRef.current[0];
     if (!latestRecent) {
@@ -1721,12 +2333,106 @@ function App() {
     }
   }, [applySceneData, showToast]);
 
+  const refreshCustomTemplates = useCallback(async () => {
+    try {
+      setCustomTemplates(await listCustomTemplates());
+    } catch {
+      showToast("Could not load custom templates");
+    }
+  }, [showToast]);
+
+  const saveCurrentAsTemplate = useCallback(async () => {
+    const currentApi = apiRef.current;
+    if (!currentApi) {
+      return;
+    }
+
+    const payload = createScenePayload(currentApi);
+    const defaultName = makeSceneTitle(payload.appState.name);
+    const requestedName =
+      typeof window.prompt === "function"
+        ? window.prompt("Template name:", defaultName)
+        : defaultName;
+
+    if (requestedName === null) {
+      showToast("Template save canceled");
+      return;
+    }
+
+    const name = requestedName.trim() || defaultName;
+    const requestedDescription =
+      typeof window.prompt === "function"
+        ? window.prompt("Template description:", "Custom canvas template")
+        : "Custom canvas template";
+
+    if (requestedDescription === null) {
+      showToast("Template save canceled");
+      return;
+    }
+
+    try {
+      await saveCustomTemplate({
+        name,
+        description: requestedDescription,
+        serializedScene: serializeScene(payload, pageSettingsRef.current),
+      });
+      await refreshCustomTemplates();
+      showToast(`Saved template ${name}`);
+    } catch {
+      showToast("Could not save template");
+    }
+  }, [refreshCustomTemplates, showToast]);
+
+  const renameTemplate = useCallback(
+    async (template: CustomCanvasTemplate) => {
+      const requestedName = window.prompt("Rename template:", template.name);
+      if (requestedName === null) {
+        return;
+      }
+
+      try {
+        await renameCustomTemplate(template, requestedName);
+        await refreshCustomTemplates();
+        showToast("Template renamed");
+      } catch {
+        showToast(`Could not rename ${template.name}`);
+      }
+    },
+    [refreshCustomTemplates, showToast],
+  );
+
+  const deleteTemplate = useCallback(
+    async (template: CustomCanvasTemplate) => {
+      if (!window.confirm(`Delete ${template.name}?`)) {
+        return;
+      }
+
+      try {
+        await deleteCustomTemplate(template);
+        await refreshCustomTemplates();
+        showToast(`Deleted ${template.name}`);
+      } catch {
+        showToast(`Could not delete ${template.name}`);
+      }
+    },
+    [refreshCustomTemplates, showToast],
+  );
+
   const applyTemplate = useCallback(
-    async (template: CanvasTemplate) => {
+    async (template: CanvasTemplate | CustomCanvasTemplate) => {
       try {
         await stageCurrentSceneForImport();
         currentSavedSceneRef.current = null;
-        await applySceneData(template.initialData, `Created ${template.name}`);
+        await applySceneData(
+          {
+            ...template.initialData,
+            appState: {
+              ...template.initialData.appState,
+              name: template.name,
+            },
+          },
+          `Created ${template.name}`,
+        );
         setTemplatePickerOpen(false);
       } catch {
         showToast(`Could not apply ${template.name}`);
@@ -1739,6 +2445,7 @@ function App() {
     (nextPageSettings: PageSettings) => {
       setPageSettings(nextPageSettings);
       pageSettingsRef.current = nextPageSettings;
+      let guardedMargins = false;
       if (isPageTemplateEnabled(nextPageSettings)) {
         const appState = apiRef.current?.getAppState();
         if (appState) {
@@ -1748,11 +2455,27 @@ function App() {
         pageViewportRef.current = null;
         setPageViewport(null);
       }
+      if (isA4MarginLocked(nextPageSettings) && apiRef.current) {
+        const payload = createScenePayload(apiRef.current);
+        guardedMargins = applyA4MarginGuard(payload.elements, {
+          appState: payload.appState,
+          files: payload.files,
+        });
+      }
       hasMeaningfulChangeRef.current = true;
       scheduleAutosave();
-      showToast(`Page template: ${getPageTemplateOption(nextPageSettings.template).name}`);
+      if (!guardedMargins) {
+        showToast(
+          `Page template: ${getPageTemplateOption(nextPageSettings.template).name}`,
+        );
+      }
     },
-    [scheduleAutosave, showToast, syncPageViewportFromAppState],
+    [
+      applyA4MarginGuard,
+      scheduleAutosave,
+      showToast,
+      syncPageViewportFromAppState,
+    ],
   );
 
   const renameCanvas = useCallback(
@@ -1792,6 +2515,28 @@ function App() {
       }
     },
     [refreshSavedScenes, showToast],
+  );
+
+  const togglePinnedCanvas = useCallback(
+    async (savedScene: SavedSceneFile) => {
+      try {
+        const pinned = await setSavedScenePinned(savedScene, !savedScene.pinned);
+        setSavedCanvasFiles((currentFiles) =>
+          currentFiles.map((currentFile) =>
+            currentFile.path === savedScene.path &&
+            currentFile.location === savedScene.location
+              ? { ...currentFile, pinned }
+              : currentFile,
+          ),
+        );
+        showToast(
+          pinned ? `Pinned ${savedScene.name}` : `Unpinned ${savedScene.name}`,
+        );
+      } catch {
+        showToast(`Could not update ${savedScene.name}`);
+      }
+    },
+    [showToast],
   );
 
   const deleteCanvas = useCallback(
@@ -1960,13 +2705,23 @@ function App() {
           onTimeline={(savedScene) => {
             void openCanvasTimeline(savedScene);
           }}
+          onTogglePinned={(savedScene) => {
+            void togglePinnedCanvas(savedScene);
+          }}
         />
       ) : null}
 
       {templatePickerOpen ? (
         <TemplatePickerModal
+          customTemplates={customTemplates}
           templates={CANVAS_TEMPLATES}
           onClose={() => setTemplatePickerOpen(false)}
+          onDeleteCustom={(template) => {
+            void deleteTemplate(template);
+          }}
+          onRenameCustom={(template) => {
+            void renameTemplate(template);
+          }}
           onSelect={(template) => {
             void applyTemplate(template);
           }}
@@ -1990,6 +2745,46 @@ function App() {
           }}
           onRestore={(file) => {
             void restoreBackup(file);
+          }}
+        />
+      ) : null}
+
+      {importAssistantPlan ? (
+        <ImportAssistantModal
+          busy={importAssistantBusy}
+          plan={importAssistantPlan}
+          onClose={() => {
+            if (!importAssistantBusy) {
+              setImportAssistantPlan(null);
+            }
+          }}
+          onConfirm={() => {
+            const plan = importAssistantPlan;
+            setImportAssistantBusy(true);
+            void executeImportPlan(plan)
+              .then(() => {
+                setImportAssistantPlan(null);
+              })
+              .catch(() => {
+                showToast("Could not import selected files");
+              })
+              .finally(() => {
+                setImportAssistantBusy(false);
+              });
+          }}
+        />
+      ) : null}
+
+      {exportCenterOpen ? (
+        <ExportCenterModal
+          busy={exportCenterBusy}
+          onClose={() => {
+            if (!exportCenterBusy) {
+              setExportCenterOpen(false);
+            }
+          }}
+          onExport={(formats) => {
+            void exportSelectedFormats(formats);
           }}
         />
       ) : null}
@@ -2021,6 +2816,8 @@ function App() {
       >
         <WelcomeScreen />
         <DrawMainMenu
+          autosaveMessage={autosaveHealth.message}
+          autosaveStatus={formatAutosaveStatus(autosaveHealth.status)}
           exportLibrary={exportLibrary}
           exportPdf={exportPdf}
           exportPng={exportPng}
@@ -2031,6 +2828,7 @@ function App() {
           objectsSnapModeEnabled={objectsSnapModeEnabled}
           openBackupCenter={() => setBackupCenterOpen(true)}
           openCanvas={openCanvas}
+          openExportCenter={() => setExportCenterOpen(true)}
           openFiles={openFiles}
           openDirectory={openDirectory}
           openPageSettings={() => setPageSettingsOpen(true)}
@@ -2040,6 +2838,7 @@ function App() {
           penMode={penMode}
           recentsCount={recents.length}
           restoreLatestAutosave={restoreLatestAutosave}
+          saveCurrentAsTemplate={saveCurrentAsTemplate}
           saveSceneCopy={saveSceneCopy}
           settings={settings}
           shareSceneCopy={shareSceneCopy}

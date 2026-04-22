@@ -6,6 +6,7 @@ import type {
 } from "../lib/persistence";
 
 type CanvasSortMode = "recent" | "name" | "size";
+type CanvasFilterMode = "all" | "pinned";
 
 type CanvasManagerModalProps = {
   savedScenes: SavedSceneFile[];
@@ -19,6 +20,7 @@ type CanvasManagerModalProps = {
   onRename: (savedScene: SavedSceneFile) => void;
   onDuplicate: (savedScene: SavedSceneFile) => void;
   onDelete: (savedScene: SavedSceneFile) => void;
+  onTogglePinned: (savedScene: SavedSceneFile) => void;
   onTimeline: (savedScene: SavedSceneFile) => void;
   onRestoreVersion: (
     savedScene: SavedSceneFile,
@@ -74,22 +76,31 @@ export function CanvasManagerModal({
   onRename,
   onRestoreVersion,
   onTimeline,
+  onTogglePinned,
   savedScenes,
   versions,
   versionsLoading,
 }: CanvasManagerModalProps) {
   const [query, setQuery] = useState("");
   const [sortMode, setSortMode] = useState<CanvasSortMode>("recent");
+  const [filterMode, setFilterMode] = useState<CanvasFilterMode>("all");
 
   const visibleScenes = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
-    const filteredScenes = normalizedQuery
-      ? savedScenes.filter((scene) =>
-          scene.name.toLowerCase().includes(normalizedQuery),
-        )
-      : savedScenes;
+    const filteredScenes = savedScenes.filter((scene) => {
+      if (filterMode === "pinned" && !scene.pinned) {
+        return false;
+      }
+
+      return normalizedQuery
+        ? scene.name.toLowerCase().includes(normalizedQuery)
+        : true;
+    });
 
     return [...filteredScenes].sort((first, second) => {
+      if (first.pinned !== second.pinned) {
+        return first.pinned ? -1 : 1;
+      }
       if (sortMode === "name") {
         return first.name.localeCompare(second.name);
       }
@@ -98,7 +109,7 @@ export function CanvasManagerModal({
       }
       return second.mtime - first.mtime || first.name.localeCompare(second.name);
     });
-  }, [query, savedScenes, sortMode]);
+  }, [filterMode, query, savedScenes, sortMode]);
 
   return (
     <div className="draw-directory-modal-backdrop" onClick={onClose}>
@@ -133,6 +144,17 @@ export function CanvasManagerModal({
             value={query}
             onChange={(event) => setQuery(event.target.value)}
           />
+          <select
+            aria-label="Filter canvases"
+            className="draw-directory-select"
+            value={filterMode}
+            onChange={(event) =>
+              setFilterMode(event.target.value as CanvasFilterMode)
+            }
+          >
+            <option value="all">All</option>
+            <option value="pinned">Pinned</option>
+          </select>
           <select
             aria-label="Sort canvases"
             className="draw-directory-select"
@@ -186,6 +208,13 @@ export function CanvasManagerModal({
                     </span>
                   </button>
                   <span className="draw-directory-entry-actions">
+                    <button
+                      aria-pressed={Boolean(savedScene.pinned)}
+                      type="button"
+                      onClick={() => onTogglePinned(savedScene)}
+                    >
+                      {savedScene.pinned ? "Pinned" : "Pin"}
+                    </button>
                     <button type="button" onClick={() => onTimeline(savedScene)}>
                       Timeline
                     </button>

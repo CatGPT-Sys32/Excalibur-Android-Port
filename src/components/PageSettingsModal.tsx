@@ -1,9 +1,12 @@
 import {
   PAGE_CANVAS_MODE_OPTIONS,
+  PAGE_MARGIN_MODE_OPTIONS,
   PAGE_TEMPLATE_OPTIONS,
   getPageCanvasModeOption,
+  getPageMarginModeOption,
   getPageTemplateOption,
   type PageCanvasMode,
+  type PageMarginMode,
   type PageSettings,
   type PageTemplateId,
 } from "../lib/pageSettings";
@@ -21,8 +24,10 @@ export function PageSettingsModal({
 }: PageSettingsModalProps) {
   const currentTemplate = getPageTemplateOption(pageSettings.template);
   const currentMode = getPageCanvasModeOption(pageSettings.mode);
+  const currentMarginMode = getPageMarginModeOption(pageSettings.marginMode);
 
   const updateMode = (mode: PageCanvasMode) => {
+    const switchingToA4 = mode === "a4-vertical" && pageSettings.mode !== mode;
     const template =
       mode === "a4-vertical" && pageSettings.template === "off"
         ? "blank-a4"
@@ -33,6 +38,12 @@ export function PageSettingsModal({
     onChange({
       ...pageSettings,
       mode,
+      marginMode:
+        mode === "a4-vertical"
+          ? switchingToA4
+            ? "locked"
+            : pageSettings.marginMode
+          : "writable",
       template,
     });
   };
@@ -46,7 +57,20 @@ export function PageSettingsModal({
     onChange({
       ...pageSettings,
       mode,
+      marginMode:
+        pageSettings.mode === "infinite" && mode === "a4-vertical"
+          ? "locked"
+          : mode === "a4-vertical"
+          ? pageSettings.marginMode
+          : "writable",
       template,
+    });
+  };
+
+  const updateMarginMode = (marginMode: PageMarginMode) => {
+    onChange({
+      ...pageSettings,
+      marginMode,
     });
   };
 
@@ -62,7 +86,12 @@ export function PageSettingsModal({
         <div className="draw-directory-modal-header">
           <div>
             <strong>Page Settings</strong>
-            <p>{currentMode.name} · {currentTemplate.name}</p>
+            <p>
+              {currentMode.name} · {currentTemplate.name}
+              {currentMode.id === "a4-vertical"
+                ? ` · ${currentMarginMode.name}`
+                : ""}
+            </p>
           </div>
           <button className="draw-directory-close" type="button" onClick={onClose}>
             Close
@@ -91,6 +120,38 @@ export function PageSettingsModal({
               })}
             </div>
           </div>
+
+          {currentMode.id === "a4-vertical" ? (
+            <div className="draw-page-settings-group">
+              <div className="draw-menu-section-title">A4 margins</div>
+              <div
+                className="draw-page-mode-toggle"
+                role="group"
+                aria-label="A4 margins"
+              >
+                {PAGE_MARGIN_MODE_OPTIONS.map((marginMode) => {
+                  const selected = marginMode.id === currentMarginMode.id;
+
+                  return (
+                    <button
+                      key={marginMode.id}
+                      className="draw-page-mode-option"
+                      type="button"
+                      aria-pressed={selected}
+                      onClick={() => updateMarginMode(marginMode.id)}
+                    >
+                      <span className="draw-menu-button-label">
+                        {marginMode.name}
+                      </span>
+                      <span className="draw-menu-button-meta">
+                        {marginMode.description}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ) : null}
 
           <div className="draw-menu-section-title">Template</div>
           {PAGE_TEMPLATE_OPTIONS.map((template) => {

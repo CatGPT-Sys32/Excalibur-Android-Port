@@ -142,6 +142,12 @@ describe("element locking", () => {
 
       expect(queryByTestId(document.body, `strokeWidth-thin`)).not.toBe(null);
       expect(
+        queryByTestId(document.body, `strokeWidth-hairline`),
+      ).not.toBeChecked();
+      expect(
+        queryByTestId(document.body, `strokeWidth-fine`),
+      ).not.toBeChecked();
+      expect(
         queryByTestId(document.body, `strokeWidth-thin`),
       ).not.toBeChecked();
       expect(

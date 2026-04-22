@@ -47,6 +47,10 @@ html[data-app-theme="dark"] .draw-page-overlay-dot {
   fill: rgba(232, 238, 255, 0.24);
 }
 
+html[data-app-theme="dark"] .draw-page-overlay-margin {
+  fill: rgba(5, 8, 14, 0.34);
+}
+
 button,
 input,
 textarea,
@@ -72,6 +76,10 @@ select {
 .draw-page-overlay-guide {
   fill: none;
   vector-effect: non-scaling-stroke;
+}
+
+.draw-page-overlay-margin {
+  fill: rgba(92, 104, 124, 0.16);
 }
 
 .draw-page-overlay-border {
@@ -332,6 +340,76 @@ select {
   display: flex;
   flex-direction: column;
   gap: 3px;
+}
+
+.draw-directory-section-label {
+  padding: 8px 6px 4px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--menu-text-soft, rgba(55, 81, 124, 0.72));
+}
+
+.draw-directory-note {
+  margin: 4px 2px;
+  padding: 8px 10px;
+  border-radius: var(--border-radius-md, 8px);
+  background: var(--color-surface-low, rgba(243, 246, 251, 0.9));
+  color: var(--menu-text-soft, rgba(41, 53, 75, 0.68));
+  font-size: 0.84rem;
+}
+
+.draw-import-summary {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+  padding: 2px;
+}
+
+.draw-import-summary div {
+  min-width: 0;
+  padding: 8px;
+  border-radius: var(--border-radius-md, 8px);
+  border: 1px solid var(--menu-border, rgba(75, 94, 129, 0.2));
+  background: var(--color-surface-low, rgba(243, 246, 251, 0.9));
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.draw-import-summary span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.74rem;
+  color: var(--menu-text-soft, rgba(41, 53, 75, 0.68));
+}
+
+.draw-import-summary strong {
+  font-size: 1rem;
+}
+
+.draw-directory-footer-actions {
+  justify-content: flex-end;
+  padding-top: 8px;
+}
+
+.draw-directory-primary-action {
+  background: var(--button-hover-bg, rgba(69, 101, 159, 0.14));
+  box-shadow: inset 0 0 0 1px var(--menu-border, rgba(75, 94, 129, 0.2));
+}
+
+.draw-export-option {
+  cursor: pointer;
+  justify-content: flex-start;
+}
+
+.draw-export-option input {
+  flex: 0 0 auto;
+  width: 1rem;
+  height: 1rem;
+  margin: 0;
 }
 
 .draw-directory-toolbar {
@@ -643,6 +721,8 @@ html[data-app-theme="dark"] .draw-directory-timeline-header span {
 html[data-app-theme="dark"] .draw-directory-search,
 html[data-app-theme="dark"] .draw-directory-select,
 html[data-app-theme="dark"] .draw-directory-thumbnail,
+html[data-app-theme="dark"] .draw-directory-note,
+html[data-app-theme="dark"] .draw-import-summary div,
 html[data-app-theme="dark"] .draw-directory-timeline {
   border-color: rgba(255, 255, 255, 0.1);
   background: rgba(255, 255, 255, 0.06);
@@ -690,6 +770,10 @@ html[data-app-theme="dark"] .draw-menu-badge {
   .draw-directory-entry-main,
   .draw-directory-entry-actions {
     width: 100%;
+  }
+
+  .draw-import-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .draw-directory-entry-actions {

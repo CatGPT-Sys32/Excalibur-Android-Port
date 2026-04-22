@@ -65,6 +65,9 @@ const sceneYToPdf = (value: number) =>
 
 const pageKey = (column: number, row: number) => `${column}:${row}`;
 
+const overlapsA4PageColumn = (minX: number, maxX: number) =>
+  maxX > PAGE_EPSILON && minX < A4_PAGE_SIZE.width - PAGE_EPSILON;
+
 const getCurrentViewportPage = (
   appState: AppState,
   pageSettings: PageSettings,
@@ -104,6 +107,10 @@ const getOccupiedPages = (
     const endRow = Math.floor((maxY - PAGE_EPSILON) / A4_PAGE_SIZE.height);
 
     if (pageSettings.mode === "a4-vertical") {
+      if (!overlapsA4PageColumn(minX, maxX)) {
+        continue;
+      }
+
       for (let row = startRow; row <= endRow; row += 1) {
         pages.set(pageKey(0, row), {
           column: 0,

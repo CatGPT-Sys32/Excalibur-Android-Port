@@ -404,6 +404,8 @@ export const ROUGHNESS = {
 } as const;
 
 export const STROKE_WIDTH = {
+  hairline: 0.25,
+  fine: 0.5,
   thin: 1,
   bold: 2,
   extraBold: 4,
